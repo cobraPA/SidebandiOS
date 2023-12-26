@@ -1,38 +1,59 @@
+
+# import sys
+
+# try:
+#     import builtins
+# except ImportError:
+#     # py2
+#     import __builtin__ as builtins
+
+# old_import = builtins.__import__
+
+# def my_import(name, *args, **kwargs):
+#     if name not in sys.modules:
+#         print('importing --> {}'.format(name))
+#     return old_import(name, *args, **kwargs)
+
+# builtins.__import__ = my_import
+
+
+
+# test import
+#from RNS.Interfaces.Interface import Interface
 import RNS
+# builds
+#import RNS.Interfaces.Interface as Interface
 import LXMF
 import threading
 import plyer
 import os.path
 import time
-import struct
 import sqlite3
 import random
+from queue import Queue
 
 import RNS.vendor.umsgpack as msgpack
-import RNS.Interfaces.Interface as Interface
+##import RNS.Interfaces.Interface as Interface
+###import RNS.Interfaces.Interface
+#from RNS.Interfaces.Interface import RNSInterface
+#from RNS.Interfaces.Interface import Interface
 
-import multiprocessing.connection
-
-from threading import Lock
 from .res import sideband_fb_data
-from .sense import Telemeter, Commands
 
 if RNS.vendor.platformutils.get_platform() == "android":
     from jnius import autoclass, cast
-    # Squelch excessive method signature logging
-    import jnius.reflect
-    class redirect_log():
-        def isEnabledFor(self, arg):
-            return False
-        def debug(self, arg):
-            pass
-    def mod(method, name, signature):
-        pass
-    jnius.reflect.log_method = mod
-    jnius.reflect.log = redirect_log()
-    ############################################
-    
 
+if RNS.vendor.platformutils.get_platform() == "ios":
+    # unused
+    ##import dispatch_ios
+    ##import RNS.Interfaces.iOS.RNodeInterface
+
+    from RNS.Interfaces import *
+    import RNS.Interfaces.AutoInterface
+    import RNS.Interfaces.TCPInterface
+    import RNS.Interfaces.iOS.RNodeInterface
+
+    
 class PropagationNodeDetector():
     EMITTED_DELTA_GRACE = 300
     EMITTED_DELTA_IGNORE = 10
@@ -89,14 +110,10 @@ class SidebandCore():
     SERVICE_JOB_INTERVAL   = 1
     PERIODIC_JOBS_INTERVAL = 60
     PERIODIC_SYNC_RETRY = 360
-    TELEMETRY_INTERVAL = 60
-    SERVICE_TELEMETRY_INTERVAL = 300
 
     IF_CHANGE_ANNOUNCE_MIN_INTERVAL = 6    # In seconds
     AUTO_ANNOUNCE_RANDOM_MIN        = 90   # In minutes
     AUTO_ANNOUNCE_RANDOM_MAX        = 480  # In minutes
-
-    DEFAULT_APPEARANCE = ["account", [0,0,0,1], [1,1,1,1]]
 
     aspect_filter = "lxmf.delivery"
     def received_announce(self, destination_hash, announced_identity, app_data):
@@ -104,11 +121,33 @@ class SidebandCore():
         # stream logger
         self.log_announce(destination_hash, app_data, dest_type=SidebandCore.aspect_filter)
 
-    def __init__(self, owner_app, is_service=False, is_client=False, android_app_dir=None, verbose=False, owner_service=None, service_context=None):
+    # iOS usage only - kjb todo - usb detection
+    def discover_usb_devices(self):
+        #self.usb_devices = []
+        self.owner_app.usb_devices = []
+#        RNS.log("Discovering attached USB devices...", RNS.LOG_EXTREME)
+#        try:
+#            devices = usb.get_usb_device_list()
+#            for device in devices:
+#                device_entry = {
+#                    "port": device.getDeviceName(),
+#                    "vid": device.getVendorId(),
+#                    "pid": device.getProductId(),
+#                    "manufacturer": device.getManufacturerName(),
+#                    "productname": device.getProductName(),
+#                }
+#                self.usb_devices.append(device_entry)
+#
+#        except Exception as e:
+#            RNS.log("Could not list USB devices. The contained exception was: "+str(e), RNS.LOG_ERROR)
+
+    def __init__(self, owner_app, is_service=False, is_client=False, android_app_dir=None, verbose=False, main_queue = None):
         self.is_service = is_service
         self.is_client = is_client
         self.db = None
 
+        self.sideband_app_main_queue = main_queue
+        
         if not self.is_service and not self.is_client:
             self.is_standalone = True
         else:
@@ -117,34 +156,16 @@ class SidebandCore():
         self.log_verbose = verbose
         self.owner_app = owner_app
         self.reticulum = None
-        self.webshare_server = None
-        self.telemeter = None
-        self.telemetry_running = False
-        self.latest_telemetry = None
-        self.latest_packed_telemetry = None
-        self.telemetry_changes = 0
-        self.pending_telemetry_send = False
-        self.pending_telemetry_send_try = 0
-        self.pending_telemetry_send_maxtries = 2
-        self.telemetry_send_blocked_until = 0
-        self.pending_telemetry_request = False
-        self.telemetry_request_max_history = 7*24*60*60
-        self.state_db = {}
-        self.state_lock = Lock()
-        self.rpc_connection = None
-        self.service_stopped = False
-        self.service_context = service_context
-        self.owner_service = owner_service
 
         self.app_dir       = plyer.storagepath.get_home_dir()+"/.config/sideband"
-        self.cache_dir     = self.app_dir+"/cache"
+        print("path1 ", self.app_dir)
         if self.app_dir.startswith("file://"):
             self.app_dir   = self.app_dir.replace("file://", "")
+        print("path2 ", self.app_dir)
         
         self.rns_configdir = None
         if RNS.vendor.platformutils.is_android():
             self.app_dir = android_app_dir+"/io.unsigned.sideband/files/"
-            self.cache_dir = self.app_dir+"/cache"
             self.rns_configdir = self.app_dir+"/app_storage/reticulum"
             self.asset_dir     = self.app_dir+"/app/assets"
         elif RNS.vendor.platformutils.is_darwin():
@@ -153,12 +174,21 @@ class SidebandCore():
         elif RNS.vendor.platformutils.get_platform() == "linux":
             core_path          = os.path.abspath(__file__)
             self.asset_dir     = core_path.replace("/sideband/core.py", "/assets")
+        elif RNS.vendor.platformutils.get_platform() == "ios":
+            self.app_dir = owner_app.user_data_dir
+            #if not os.path.isdir(plyer.storagepath.get_home_dir()+"/.config"):
+            #    os.makedirs(plyer.storagepath.get_home_dir()+"/.config")
+            #if not os.path.isdir(plyer.storagepath.get_home_dir()+"/.config/sideband"):
+            #    os.makedirs(plyer.storagepath.get_home_dir()+"/.config/sideband")
+            # Don't use absolute on iOS - fails - no, wrong location
+            #self.app_dir       = "Documents/reticulum"
+            self.rns_configdir = self.app_dir+"/app_storage/reticulum"
+            #if not os.path.isdir(self.app_dir):
+            #    os.makedirs(self.app_dir)
+            self.asset_dir     = "sideband-kb.app/assets"
+            
         else:
             self.asset_dir     = plyer.storagepath.get_application_dir()+"/sbapp/assets"
-
-        self.map_cache         = self.cache_dir+"/maps"
-        if not os.path.isdir(self.map_cache):
-            os.makedirs(self.map_cache)
 
         self.icon              = self.asset_dir+"/icon.png"
         self.icon_48           = self.asset_dir+"/icon_48.png"
@@ -176,25 +206,20 @@ class SidebandCore():
         self.log_dir       = self.app_dir+"/app_storage/"
         self.tmp_dir       = self.app_dir+"/app_storage/tmp"
         self.exports_dir   = self.app_dir+"/exports"
-        self.webshare_dir  = "./share/"
         
         self.first_run     = True
         self.saving_configuration = False
         self.last_lxmf_announce = 0
         self.last_if_change_announce = 0
-        self.interface_local_adding = False
         self.next_auto_announce = time.time() + 60*(random.random()*(SidebandCore.AUTO_ANNOUNCE_RANDOM_MAX-SidebandCore.AUTO_ANNOUNCE_RANDOM_MIN))
+
+        self.getstate_cache = {}
 
         try:
             if not os.path.isfile(self.config_path):
                 self.__init_config()
-                self.__load_config()
             else:
-                try:
-                    self.__load_config()
-                except Exception as e:
-                    self.__init_config()
-                    self.__load_config()
+                self.__load_config()
                 self.first_run = False
 
             if self.config["debug"]:
@@ -236,6 +261,9 @@ class SidebandCore():
         
         else:
             pass
+        
+        if RNS.vendor.platformutils.get_platform() == "ios":
+            self.discover_usb_devices()
 
         self.active_propagation_node = None
         self.propagation_detector = PropagationNodeDetector(self)
@@ -278,12 +306,10 @@ class SidebandCore():
         self.config["lxmf_sync_limit"] = None
         self.config["lxmf_sync_max"] = 3
         self.config["lxmf_periodic_sync"] = False
-        self.config["lxmf_ignore_unknown"] = False
         self.config["lxmf_sync_interval"] = 43200
         self.config["last_lxmf_propagation_node"] = None
         self.config["nn_home_node"] = None
         self.config["print_command"] = "lp"
-        self.config["eink_mode"] = False
 
         # Connectivity
         self.config["connect_transport"] = False
@@ -291,7 +317,9 @@ class SidebandCore():
         self.config["connect_local_groupid"] = ""
         self.config["connect_local_ifac_netname"] = ""
         self.config["connect_local_ifac_passphrase"] = ""
+        # kjb test
         self.config["connect_tcp"] = False
+        #self.config["connect_tcp"] = True
         self.config["connect_tcp_host"] = "sideband.connect.reticulum.network"
         self.config["connect_tcp_port"] = "7822"
         self.config["connect_tcp_ifac_netname"] = ""
@@ -300,7 +328,9 @@ class SidebandCore():
         self.config["connect_i2p_b32"] = "pmlm3l5rpympihoy2o5ago43kluei2jjjzsalcuiuylbve3mwi2a.b32.i2p"
         self.config["connect_i2p_ifac_netname"] = ""
         self.config["connect_i2p_ifac_passphrase"] = ""
-        self.config["connect_rnode"] = False
+        # kjb test RNode
+        #self.config["connect_rnode"] = False
+        self.config["connect_rnode"] = True
         self.config["connect_rnode_ifac_netname"] = ""
         self.config["connect_rnode_ifac_passphrase"] = ""
         self.config["connect_serial"] = False
@@ -316,7 +346,6 @@ class SidebandCore():
         self.config["connect_ifmode_modem"] = "full"
         self.config["connect_ifmode_serial"] = "full"
         self.config["connect_ifmode_bluetooth"] = "full"
-        
         # Hardware
         self.config["hw_rnode_frequency"] = None
         self.config["hw_rnode_modulation"] = "LoRa"
@@ -343,34 +372,13 @@ class SidebandCore():
         self.config["hw_serial_stopbits"] = 1
         self.config["hw_serial_parity"] = "none"
 
-        # Telemetry
-        self.config["telemetry_enabled"] = False
-        self.config["telemetry_icon"] = SidebandCore.DEFAULT_APPEARANCE[0]
-        self.config["telemetry_send_to_trusted"] = False
-        self.config["telemetry_send_to_collector"] = False
-
         if not os.path.isfile(self.db_path):
             self.__db_init()
         else:
             self._db_initstate()
             self._db_initpersistent()
-            self._db_inittelemetry()
-            self._db_upgradetables()
 
         self.__save_config()
-
-    def clear_map_cache(self):
-        for entry in os.scandir(self.map_cache):
-            os.unlink(entry.path)
-            
-    def get_map_cache_size(self):
-        total = 0
-        for entry in os.scandir(self.map_cache):
-            if entry.is_dir(follow_symlinks=False):
-                pass
-            else:
-                total += entry.stat(follow_symlinks=False).st_size
-        return total
 
     def should_persist_data(self):
         if self.reticulum != None:
@@ -382,9 +390,6 @@ class SidebandCore():
         RNS.log("Loading Sideband identity...", RNS.LOG_DEBUG)
         self.identity = RNS.Identity.from_file(self.identity_path)
 
-        self.rpc_addr = ("127.0.0.1", 48165)
-        self.rpc_key  = RNS.Identity.full_hash(self.identity.get_private_key())
-
         RNS.log("Loading Sideband configuration... "+str(self.config_path), RNS.LOG_DEBUG)
         config_file = open(self.config_path, "rb")
         self.config = msgpack.unpackb(config_file.read())
@@ -395,24 +400,14 @@ class SidebandCore():
             self.config["debug"] = False
         if not "dark_ui" in self.config:
             self.config["dark_ui"] = True
-        if not "advanced_stats" in self.config:
-            self.config["advanced_stats"] = False
         if not "lxmf_periodic_sync" in self.config:
             self.config["lxmf_periodic_sync"] = False
-        if not "lxmf_ignore_unknown" in self.config:
-            self.config["lxmf_ignore_unknown"] = False
         if not "lxmf_sync_interval" in self.config:
             self.config["lxmf_sync_interval"] = 43200
-        if not "lxmf_try_propagation_on_fail" in self.config:
-            self.config["lxmf_try_propagation_on_fail"] = True
         if not "notifications_on" in self.config:
             self.config["notifications_on"] = True
         if not "print_command" in self.config:
             self.config["print_command"] = "lp"
-        if not "eink_mode" in self.config:
-            self.config["eink_mode"] = False
-        if not "display_style_in_contact_list" in self.config:
-            self.config["display_style_in_contact_list"] = False
 
         if not "connect_transport" in self.config:
             self.config["connect_transport"] = False
@@ -468,14 +463,8 @@ class SidebandCore():
             self.config["hw_rnode_beacondata"] = None
         if not "hw_rnode_bluetooth" in self.config:
             self.config["hw_rnode_bluetooth"] = False
-        if not "hw_rnode_enable_framebuffer" in self.config:
-            self.config["hw_rnode_enable_framebuffer"] = False
         if not "hw_rnode_bt_device" in self.config:
             self.config["hw_rnode_bt_device"] = None
-        if not "hw_rnode_atl_short" in self.config:
-            self.config["hw_rnode_atl_short"] = None
-        if not "hw_rnode_atl_long" in self.config:
-            self.config["hw_rnode_atl_long"] = None
 
         if not "hw_modem_baudrate" in self.config:
             self.config["hw_modem_baudrate"] = 115200
@@ -507,126 +496,21 @@ class SidebandCore():
         if not "hw_serial_parity" in self.config:
             self.config["hw_serial_parity"] = "none"
 
-        if not "telemetry_enabled" in self.config:
-            self.config["telemetry_enabled"] = False
-        if not "telemetry_collector" in self.config:
-            self.config["telemetry_collector"] = None
-        if not "telemetry_send_to_trusted" in self.config:
-            self.config["telemetry_send_to_trusted"] = False
-        if not "telemetry_send_to_collector" in self.config:
-            self.config["telemetry_send_to_collector"] = False
-        if not "telemetry_request_from_collector" in self.config:
-            self.config["telemetry_request_from_collector"] = False
-        if not "telemetry_send_interval" in self.config:
-            self.config["telemetry_send_interval"] = 43200
-        if not "telemetry_request_interval" in self.config:
-            self.config["telemetry_request_interval"] = 43200
-        if not "telemetry_collector_enabled" in self.config:
-            self.config["telemetry_collector_enabled"] = False
-
-        if not "telemetry_icon" in self.config:
-            self.config["telemetry_icon"] = SidebandCore.DEFAULT_APPEARANCE[0]
-        if not "telemetry_fg" in self.config:
-            self.config["telemetry_fg"] = SidebandCore.DEFAULT_APPEARANCE[1]
-        if not "telemetry_bg" in self.config:
-            self.config["telemetry_bg"] = SidebandCore.DEFAULT_APPEARANCE[2]
-        if not "telemetry_send_appearance" in self.config:
-            self.config["telemetry_send_appearance"] = False
-        if not "telemetry_display_trusted_only" in self.config:
-            self.config["telemetry_display_trusted_only"] = False
-        if not "telemetry_receive_trusted_only" in self.config:
-            self.config["telemetry_receive_trusted_only"] = False
-
-        if not "telemetry_send_all_to_collector" in self.config:
-            self.config["telemetry_send_all_to_collector"] = False
-        if not "telemetry_use_propagation_only" in self.config:
-            self.config["telemetry_use_propagation_only"] = False
-        if not "telemetry_try_propagation_on_fail" in self.config:
-            self.config["telemetry_try_propagation_on_fail"] = True
-        if not "telemetry_requests_only_send_latest" in self.config:
-            self.config["telemetry_requests_only_send_latest"] = True
-        if not "telemetry_allow_requests_from_trusted" in self.config:
-            self.config["telemetry_allow_requests_from_trusted"] = False
-        if not "telemetry_allow_requests_from_anyone" in self.config:
-            self.config["telemetry_allow_requests_from_anyone"] = False
-
-        if not "telemetry_s_location" in self.config:
-            self.config["telemetry_s_location"] = False
-        if not "telemetry_s_battery" in self.config:
-            self.config["telemetry_s_battery"] = False
-        if not "telemetry_s_pressure" in self.config:
-            self.config["telemetry_s_pressure"] = False
-        if not "telemetry_s_temperature" in self.config:
-            self.config["telemetry_s_temperature"] = False
-        if not "telemetry_s_humidity" in self.config:
-            self.config["telemetry_s_humidity"] = False
-        if not "telemetry_s_magnetic_field" in self.config:
-            self.config["telemetry_s_magnetic_field"] = False
-        if not "telemetry_s_ambient_light" in self.config:
-            self.config["telemetry_s_ambient_light"] = False
-        if not "telemetry_s_gravity" in self.config:
-            self.config["telemetry_s_gravity"] = False
-        if not "telemetry_s_angular_velocity" in self.config:
-            self.config["telemetry_s_angular_velocity"] = False
-        if not "telemetry_s_acceleration" in self.config:
-            self.config["telemetry_s_acceleration"] = False
-        if not "telemetry_s_proximity" in self.config:
-            self.config["telemetry_s_proximity"] = False
-        if not "telemetry_s_fixed_location" in self.config:
-            self.config["telemetry_s_fixed_location"] = False
-        if not "telemetry_s_fixed_latlon" in self.config:
-            self.config["telemetry_s_fixed_latlon"] = [0.0, 0.0]
-        if not "telemetry_s_fixed_altitude" in self.config:
-            self.config["telemetry_s_fixed_altitude"] = 0.0
-        if not "telemetry_s_information" in self.config:
-            self.config["telemetry_s_information"] = False
-        if not "telemetry_s_information_text" in self.config:
-            self.config["telemetry_s_information_text"] = ""
-
-        if not "map_history_limit" in self.config:
-            self.config["map_history_limit"] = 7*24*60*60
-        if not "map_lat" in self.config:
-            self.config["map_lat"] = 0.0
-        if not "map_lon" in self.config:
-            self.config["map_lon"] = 0.0
-        if not "map_zoom" in self.config:
-            self.config["map_zoom"] = 3
-        if not "map_storage_external" in self.config:
-            self.config["map_storage_external"] = False
-        if not "map_use_offline" in self.config:
-            self.config["map_use_offline"] = False
-        if not "map_use_online" in self.config:
-            self.config["map_use_online"] = True
-        if not "map_layer" in self.config:
-            self.config["map_layer"] = None
-        
-        if not "map_storage_path" in self.config:
-            self.config["map_storage_path"] = None
-        if not "map_storage_file" in self.config:
-            self.config["map_storage_file"] = None
-
         # Make sure we have a database
         if not os.path.isfile(self.db_path):
             self.__db_init()
         else:
             self._db_initstate()
             self._db_initpersistent()
-            self._db_inittelemetry()
-            self._db_upgradetables()
             self.__db_indices()
 
     def __reload_config(self):
-        RNS.log("Reloading Sideband configuration... ", RNS.LOG_DEBUG)
-        with open(self.config_path, "rb") as config_file:
-            config_data = config_file.read()
+        RNS.log("Reloading Sideband configuration... "+str(self.config_path), RNS.LOG_DEBUG)
+        config_file = open(self.config_path, "rb")
+        self.config = msgpack.unpackb(config_file.read())
+        config_file.close()
 
-        try:
-            unpacked_config = msgpack.unpackb(config_data)
-            if unpacked_config != None and len(unpacked_config) != 0:
-                self.config = unpacked_config
-                self.update_active_lxmf_propagation_node()
-        except Exception as e:
-            RNS.log("Error while reloading configuration: "+str(e), RNS.LOG_ERROR)
+        self.update_active_lxmf_propagation_node()
 
     def __save_config(self):
         RNS.log("Saving Sideband configuration...", RNS.LOG_DEBUG)
@@ -689,9 +573,7 @@ class SidebandCore():
 
     def log_announce(self, dest, app_data, dest_type):
         try:
-            if app_data == None:
-                app_data = b""
-            RNS.log("Received "+str(dest_type)+" announce for "+RNS.prettyhexrep(dest)+" with data: "+app_data.decode("utf-8"), RNS.LOG_DEBUG)
+            RNS.log("Received "+str(dest_type)+" announce for "+RNS.prettyhexrep(dest)+" with data: "+app_data.decode("utf-8"))
             self._db_save_announce(dest, app_data, dest_type)
             self.setstate("app.flags.new_announces", True)
 
@@ -719,13 +601,9 @@ class SidebandCore():
         else:
             return False
 
-    def is_trusted(self, context_dest, conv_data = None):
+    def is_trusted(self, context_dest):
         try:
-            if conv_data == None:
-                existing_conv = self._db_conversation(context_dest)
-            else:
-                existing_conv = conv_data
-
+            existing_conv = self._db_conversation(context_dest)
             if existing_conv != None:
                 if existing_conv["trust"] == 1:
                     return True
@@ -736,60 +614,6 @@ class SidebandCore():
 
         except Exception as e:
             RNS.log("Error while checking trust for "+RNS.prettyhexrep(context_dest)+": "+str(e), RNS.LOG_ERROR)
-            return False
-
-    def should_send_telemetry(self, context_dest):
-        try:
-            if self.config["telemetry_enabled"]:
-                existing_conv = self._db_conversation(context_dest)
-                if existing_conv != None:
-                    cd = existing_conv["data"]
-                    if cd != None and "telemetry" in cd and cd["telemetry"] == True:
-                        return True
-                    else:
-                        if self.is_trusted(context_dest, conv_data=existing_conv) and self.config["telemetry_send_to_trusted"]:
-                            return True
-                        else:
-                            return False
-                else:
-                    return False
-
-            else:
-                return False
-
-        except Exception as e:
-            RNS.log("Error while checking telemetry sending for "+RNS.prettyhexrep(context_dest)+": "+str(e), RNS.LOG_ERROR)
-            return False
-
-    def allow_request_from(self, context_dest):
-        try:
-            if self.config["telemetry_allow_requests_from_anyone"] == True:
-                return True
-
-            if self.config["telemetry_allow_requests_from_trusted"] == True:
-                existing_conv = self._db_conversation(context_dest)
-                return existing_conv["trust"] == 1
-
-            return self.requests_allowed_from(context_dest)
-        
-        except Exception as e:
-            RNS.log("Error while checking request permissions for "+RNS.prettyhexrep(context_dest)+": "+str(e), RNS.LOG_ERROR)
-            return False
-
-    def requests_allowed_from(self, context_dest):
-        try:
-            existing_conv = self._db_conversation(context_dest)
-            if existing_conv != None:
-                cd = existing_conv["data"]
-                if cd != None and "allow_requests" in cd and cd["allow_requests"] == True:
-                    return True
-                else:
-                    return False
-            else:
-                return False
-
-        except Exception as e:
-            RNS.log("Error while checking request permissions for "+RNS.prettyhexrep(context_dest)+": "+str(e), RNS.LOG_ERROR)
             return False
 
     def raw_display_name(self, context_dest):
@@ -807,18 +631,7 @@ class SidebandCore():
             RNS.log("Error while getting peer name: "+str(e), RNS.LOG_ERROR)
             return ""
 
-    def peer_appearance(self, context_dest, conv=None):
-        appearance = self._db_get_appearance(context_dest, conv=conv)
-        if appearance == None:
-            return SidebandCore.DEFAULT_APPEARANCE
-        for e in appearance:
-            if e == None:
-                return SidebandCore.DEFAULT_APPEARANCE
-        return appearance
-
     def peer_display_name(self, context_dest):
-        if context_dest == self.lxmf_destination.hash:
-            return self.config["display_name"]
         try:
             existing_conv = self._db_conversation(context_dest)
             if existing_conv != None:
@@ -852,15 +665,11 @@ class SidebandCore():
     def clear_conversation(self, context_dest):
         self._db_clear_conversation(context_dest)
 
-    def clear_telemetry(self, context_dest):
-        self._db_clear_telemetry(context_dest)
-
     def delete_announce(self, context_dest):
         self._db_delete_announce(context_dest)
 
     def delete_conversation(self, context_dest):
         self._db_clear_conversation(context_dest)
-        self._db_clear_telemetry(context_dest)
         self._db_delete_conversation(context_dest)
 
     def delete_message(self, message_hash):
@@ -869,29 +678,14 @@ class SidebandCore():
     def read_conversation(self, context_dest):
         self._db_conversation_set_unread(context_dest, False)
 
-    def unread_conversation(self, context_dest, tx=False):
-        self._db_conversation_set_unread(context_dest, True, tx=tx)
-
-    def txtime_conversation(self, context_dest):
-        self._db_conversation_update_txtime(context_dest)
+    def unread_conversation(self, context_dest):
+        self._db_conversation_set_unread(context_dest, True)
 
     def trusted_conversation(self, context_dest):
         self._db_conversation_set_trusted(context_dest, True)
 
     def untrusted_conversation(self, context_dest):
         self._db_conversation_set_trusted(context_dest, False)
-
-    def send_telemetry_in_conversation(self, context_dest):
-        self._db_conversation_set_telemetry(context_dest, True)
-
-    def no_telemetry_in_conversation(self, context_dest):
-        self._db_conversation_set_telemetry(context_dest, False)
-
-    def allow_requests_from(self, context_dest):
-        self._db_conversation_set_requests(context_dest, True)
-
-    def disallow_requests_from(self, context_dest):
-        self._db_conversation_set_requests(context_dest, False)
 
     def named_conversation(self, name, context_dest):
         self._db_conversation_set_name(context_dest, name)
@@ -903,234 +697,6 @@ class SidebandCore():
         else:
             return None
 
-    def outbound_telemetry_finished(self, message):
-        if message.state == LXMF.LXMessage.FAILED and hasattr(message, "try_propagation_on_fail") and message.try_propagation_on_fail:
-            RNS.log("Direct delivery of telemetry update "+str(message)+" failed. Retrying as propagated message.", RNS.LOG_VERBOSE)
-            message.try_propagation_on_fail = None
-            message.delivery_attempts = 0
-            del message.next_delivery_attempt
-            message.packed = None
-            message.desired_method = LXMF.LXMessage.PROPAGATED
-            self.message_router.handle_outbound(message)
-        else:
-            if message.state == LXMF.LXMessage.DELIVERED:
-                self.setpersistent(f"telemetry.{RNS.hexrep(message.destination_hash, delimit=False)}.last_send_success_timebase", message.telemetry_timebase)
-                self.setstate(f"telemetry.{RNS.hexrep(message.destination_hash, delimit=False)}.update_sending", False)
-                if message.destination_hash == self.config["telemetry_collector"]:
-                    self.pending_telemetry_send = False
-                    self.pending_telemetry_send_try = 0
-                    self.telemetry_send_blocked_until = 0
-            else:
-                self.setstate(f"telemetry.{RNS.hexrep(message.destination_hash, delimit=False)}.update_sending", False)
-
-
-    def telemetry_request_finished(self, message):
-        if message.state == LXMF.LXMessage.FAILED and hasattr(message, "try_propagation_on_fail") and message.try_propagation_on_fail:
-            RNS.log("Direct delivery of telemetry request "+str(message)+" failed. Retrying as propagated message.", RNS.LOG_VERBOSE)
-            message.try_propagation_on_fail = None
-            message.delivery_attempts = 0
-            del message.next_delivery_attempt
-            message.packed = None
-            message.desired_method = LXMF.LXMessage.PROPAGATED
-            self.message_router.handle_outbound(message)
-        else:
-            if message.state == LXMF.LXMessage.DELIVERED:
-                self.setpersistent(f"telemetry.{RNS.hexrep(message.destination_hash, delimit=False)}.last_request_success_timebase", message.request_timebase)
-                self.setstate(f"telemetry.{RNS.hexrep(message.destination_hash, delimit=False)}.request_sending", False)
-                if message.destination_hash == self.config["telemetry_collector"]:
-                    self.pending_telemetry_request = False
-                    self.pending_telemetry_request_try = 0
-                    self.telemetry_request_blocked_until = 0
-            else:
-                self.setstate(f"telemetry.{RNS.hexrep(message.destination_hash, delimit=False)}.request_sending", False)
-
-
-    def request_latest_telemetry(self, from_addr=None):
-        if from_addr == None or from_addr == self.lxmf_destination.hash:
-            return "no_address"
-        else:
-            if self.getstate(f"telemetry.{RNS.hexrep(from_addr, delimit=False)}.request_sending") == True:
-                RNS.log("Not sending new telemetry request, since an earlier transfer is already in progress", RNS.LOG_DEBUG)
-                return "in_progress"
-
-            if from_addr != None:
-                dest_identity = RNS.Identity.recall(from_addr)
-                
-                if dest_identity == None:
-                    RNS.log("The identity for "+RNS.prettyhexrep(from_addr)+" could not be recalled. Requesting identity from network...", RNS.LOG_DEBUG)
-                    RNS.Transport.request_path(from_addr)
-                    return "destination_unknown"
-
-                else:
-                    now = time.time()
-                    dest = RNS.Destination(dest_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
-                    source = self.lxmf_destination
-                    
-                    if self.config["telemetry_use_propagation_only"] == True:
-                        desired_method = LXMF.LXMessage.PROPAGATED
-                    else:
-                        desired_method = LXMF.LXMessage.DIRECT
-
-                    request_timebase = self.getpersistent(f"telemetry.{RNS.hexrep(from_addr, delimit=False)}.timebase") or now - self.telemetry_request_max_history
-                    lxm_fields = { LXMF.FIELD_COMMANDS: [
-                        {Commands.TELEMETRY_REQUEST: request_timebase},
-                    ]}
-
-                    lxm = LXMF.LXMessage(dest, source, "", desired_method=desired_method, fields = lxm_fields)
-                    lxm.request_timebase = request_timebase
-                    lxm.register_delivery_callback(self.telemetry_request_finished)
-                    lxm.register_failed_callback(self.telemetry_request_finished)
-
-                    if self.message_router.get_outbound_propagation_node() != None:
-                        if self.config["telemetry_try_propagation_on_fail"]:
-                            lxm.try_propagation_on_fail = True
-
-                    RNS.log(f"Sending telemetry request with timebase {request_timebase}", RNS.LOG_DEBUG)
-                    self.setpersistent(f"telemetry.{RNS.hexrep(from_addr, delimit=False)}.last_request_attempt", time.time())
-                    self.setstate(f"telemetry.{RNS.hexrep(from_addr, delimit=False)}.request_sending", True)
-                    self.message_router.handle_outbound(lxm)
-                    return "sent"
-
-            else:
-                return "not_sent"
-
-
-    def send_latest_telemetry(self, to_addr=None, stream=None, is_authorized_telemetry_request=False):
-        if to_addr == None or to_addr == self.lxmf_destination.hash:
-            return "no_address"
-        else:
-            if to_addr == self.config["telemetry_collector"]:
-                is_authorized_telemetry_request = True
-
-            if self.getstate(f"telemetry.{RNS.hexrep(to_addr, delimit=False)}.update_sending") == True:
-                RNS.log("Not sending new telemetry update, since an earlier transfer is already in progress", RNS.LOG_DEBUG)
-                return "in_progress"
-
-            if (self.latest_packed_telemetry != None and self.latest_telemetry != None) or stream != None:
-                dest_identity = RNS.Identity.recall(to_addr)
-                
-                if dest_identity == None:
-                    RNS.log("The identity for "+RNS.prettyhexrep(to_addr)+" could not be recalled. Requesting identity from network...", RNS.LOG_DEBUG)
-                    RNS.Transport.request_path(to_addr)
-                    return "destination_unknown"
-
-                else:
-                    dest = RNS.Destination(dest_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
-                    source = self.lxmf_destination
-                    
-                    if self.config["telemetry_use_propagation_only"] == True:
-                        desired_method = LXMF.LXMessage.PROPAGATED
-                    else:
-                        desired_method = LXMF.LXMessage.DIRECT
-
-                    lxm_fields = self.get_message_fields(to_addr, is_authorized_telemetry_request=is_authorized_telemetry_request, signal_already_sent=True)
-                    if lxm_fields == False and stream == None:
-                        return "already_sent"
-
-                    if stream != None and len(stream) > 0:
-                        if lxm_fields == False:
-                            lxm_fields = {}
-                        lxm_fields[LXMF.FIELD_TELEMETRY_STREAM] = stream
-
-                    if lxm_fields != None and lxm_fields != False and (LXMF.FIELD_TELEMETRY in lxm_fields or LXMF.FIELD_TELEMETRY_STREAM in lxm_fields):
-                        if LXMF.FIELD_TELEMETRY in lxm_fields:
-                            telemeter = Telemeter.from_packed(lxm_fields[LXMF.FIELD_TELEMETRY])
-                            telemetry_timebase = telemeter.read_all()["time"]["utc"]
-                        elif LXMF.FIELD_TELEMETRY_STREAM in lxm_fields:
-                            telemetry_timebase = 0
-                            for te in lxm_fields[LXMF.FIELD_TELEMETRY_STREAM]:
-                                ts = te[1]
-                                telemetry_timebase = max(telemetry_timebase, ts)
-
-                        if telemetry_timebase > (self.getpersistent(f"telemetry.{RNS.hexrep(to_addr, delimit=False)}.last_send_success_timebase") or 0):
-                            lxm = LXMF.LXMessage(dest, source, "", desired_method=desired_method, fields = lxm_fields)
-                            lxm.telemetry_timebase = telemetry_timebase
-                            lxm.register_delivery_callback(self.outbound_telemetry_finished)
-                            lxm.register_failed_callback(self.outbound_telemetry_finished)
-
-                            if self.message_router.get_outbound_propagation_node() != None:
-                                if self.config["telemetry_try_propagation_on_fail"]:
-                                    lxm.try_propagation_on_fail = True
-
-                            RNS.log(f"Sending telemetry update with timebase {telemetry_timebase}", RNS.LOG_DEBUG)
-
-                            self.setpersistent(f"telemetry.{RNS.hexrep(to_addr, delimit=False)}.last_send_attempt", time.time())
-                            self.setstate(f"telemetry.{RNS.hexrep(to_addr, delimit=False)}.update_sending", True)
-                            self.message_router.handle_outbound(lxm)
-                            return "sent"
-                        
-                        else:
-                            RNS.log(f"Telemetry update with timebase {telemetry_timebase} was already successfully sent", RNS.LOG_DEBUG)
-                            return "already_sent"
-                    else:
-                        return "nothing_to_send"
-
-            else:
-                RNS.log("A telemetry update was requested, but there was nothing to send.", RNS.LOG_WARNING)
-                return "nothing_to_send"
-
-
-    def list_telemetry(self, context_dest = None, after = None, before = None, limit = None):
-        return self._db_telemetry(context_dest = context_dest, after = after, before = before, limit = limit) or []
-
-    def peer_telemetry(self, context_dest, after = None, before = None, limit = None):
-        if context_dest == self.lxmf_destination.hash and limit == 1:
-            try:
-                if self.latest_telemetry != None and self.latest_packed_telemetry != None:
-                    return [[self.latest_telemetry["time"]["utc"], self.latest_packed_telemetry]]
-                else:
-                    return []
-
-            except Exception as e:
-                RNS.log("An error occurred while retrieving telemetry from the database: "+str(e), RNS.LOG_ERROR)
-                return []
-
-        try:
-            pts = self._db_telemetry(context_dest, after = after, before = before, limit = limit)
-            if pts != None:
-                if context_dest in pts:
-                    return pts[context_dest]
-        except Exception as e:
-            RNS.log("An error occurred while retrieving telemetry from the database: "+str(e), RNS.LOG_ERROR)
-
-        return []
-
-    def owm_location(self):
-        return self.peer_location(self.lxmf_destination.hash)
-
-    def peer_location(self, context_dest):
-        if context_dest == None:
-            return None
-
-        if context_dest == self.lxmf_destination.hash:
-            try:
-                if self.latest_telemetry != None:
-                    lt = self.latest_telemetry
-                    if "location" in lt and lt["location"] != None:
-                        l = lt["location"]
-                        if "latitude" in l and "longitude" in l:
-                            if l["latitude"] != None and l["longitude"] != None:
-                                return l
-                return None
-
-            except Exception as e:
-                RNS.log("Error while getting own location: "+str(e), RNS.LOG_ERROR)
-
-        after_time = time.time()-3*30*24*60*60
-        pts = self.peer_telemetry(context_dest, after=after_time)
-        for pt in pts:
-            try:
-                t = Telemeter.from_packed(pt[1]).read_all()
-                if "location" in t and t["location"] != None:
-                    l = t["location"]
-                    if "latitude" in l and "longitude" in l:
-                        if l["latitude"] != None and l["longitude"] != None:
-                            return l
-            except:
-                pass
-
-        return None
-
     def list_messages(self, context_dest, after = None, before = None, limit = None):
         result = self._db_messages(context_dest, after, before, limit)
         if result != None:
@@ -1139,183 +705,76 @@ class SidebandCore():
             return []
 
     def service_available(self):
-        now = time.time()
         service_heartbeat = self.getstate("service.heartbeat")
         if not service_heartbeat:
-            RNS.log("No service heartbeat available at "+str(now), RNS.LOG_DEBUG)
             return False
         else:
             try:
-                if now - service_heartbeat > 4.0:
-                    RNS.log("Stale service heartbeat at "+str(now), RNS.LOG_DEBUG)
+                if time.time() - service_heartbeat > 2.5:
                     return False
                 else:
                     return True
-            except Exception as e:
-                RNS.log("Error while getting service heartbeat: "+str(e), RNS.LOG_ERROR)
-                RNS.log("Response was: "+str(service_heartbeat), RNS.LOG_ERROR)
+            except:
                 return False
 
     def gui_foreground(self):
-        return self.getstate("app.foreground")
+        return self._db_getstate("app.foreground")
 
     def gui_display(self):
-        return self.getstate("app.displaying")
+        return self._db_getstate("app.displaying")
 
     def gui_conversation(self):
-        return self.getstate("app.active_conversation")
+        return self._db_getstate("app.active_conversation")
 
     def setstate(self, prop, val):
-        with self.state_lock:
-            if not self.service_stopped:
-                if not RNS.vendor.platformutils.is_android():
-                    self.state_db[prop] = val
-                    return True
-                else:
-                    if self.is_service:
-                        self.state_db[prop] = val
-                        return True
-                    else:
-                        def set():
-                            if self.rpc_connection == None:
-                                self.rpc_connection = multiprocessing.connection.Client(self.rpc_addr, authkey=self.rpc_key)
-                            self.rpc_connection.send({"setstate": (prop, val)})
-                            response = self.rpc_connection.recv()
-                            return response
-
-                        try:
-                            set()
-                        except Exception as e:
-                            RNS.log("Error while setting state over RPC: "+str(e)+". Retrying once.", RNS.LOG_DEBUG)
-                            try:
-                                set()
-                            except Exception as e:
-                                RNS.log("Error on retry as well: "+str(e)+". Giving up.", RNS.LOG_DEBUG)
-                                return False
-
-    def service_set_latest_telemetry(self, latest_telemetry, latest_packed_telemetry):
-        if not RNS.vendor.platformutils.is_android():
-            pass
-        else:
-            if self.is_service:
-                self.latest_telemetry = latest_telemetry
-                self.latest_packed_telemetry = latest_packed_telemetry
-                return True
-            else:
-                try:
-                    if self.rpc_connection == None:
-                        self.rpc_connection = multiprocessing.connection.Client(self.rpc_addr, authkey=self.rpc_key)
-                    self.rpc_connection.send({"latest_telemetry": (latest_telemetry, latest_packed_telemetry)})
-                    response = self.rpc_connection.recv()
-                    return response
-                except Exception as e:
-                    RNS.log("Error while setting telemetry over RPC: "+str(e), RNS.LOG_DEBUG)
-                    return False
-
-    def service_rpc_set_debug(self, debug):
-        if not RNS.vendor.platformutils.is_android():
-            pass
-        else:
-            if self.is_service:
-                if debug:
-                    RNS.loglevel = 6
-                else:
-                    RNS.loglevel = 2
-                return True
-            else:
-                try:
-                    if self.rpc_connection == None:
-                        self.rpc_connection = multiprocessing.connection.Client(self.rpc_addr, authkey=self.rpc_key)
-                    self.rpc_connection.send({"set_debug": debug})
-                    response = self.rpc_connection.recv()
-                    return response
-                except Exception as e:
-                    RNS.log("Error while setting log level over RPC: "+str(e), RNS.LOG_DEBUG)
-                    return False
+        #if RNS.vendor.platformutils.get_platform() == "ios":
+        #    self.getstate_cache[prop] = val
+        #else:
+        self.getstate_cache[prop] = val
+        self._db_setstate(prop, val)
+        # def cb():
+        #     self._db_setstate(prop, val)
+        # threading.Thread(target=cb, daemon=True).start()
 
     def getstate(self, prop, allow_cache=False):
-        with self.state_lock:
-            if not self.service_stopped:
-                # TODO: remove
-                # us = time.time()
+        #if RNS.vendor.platformutils.get_platform() == "ios":
+        #    return self.getstate_cache[prop]
 
-                if not RNS.vendor.platformutils.is_android():
-                    if prop in self.state_db:
-                        return self.state_db[prop]
-                    else:
-                        return None
+        #elif not RNS.vendor.platformutils.is_android():
+        if not RNS.vendor.platformutils.is_android():
+            return self._db_getstate(prop)
+
+        else:
+            db_timeout = 0.060
+            cached_value = None
+            has_cached_value = False
+            if prop in self.getstate_cache:
+                cached_value = self.getstate_cache[prop]
+                has_cached_value = True
+            
+            if not allow_cache or not has_cached_value:
+                self.getstate_cache[prop] = self._db_getstate(prop)
+                return self.getstate_cache[prop]
+            
+            else:
+                get_thread_running = True
+                def get_job():
+                    self.getstate_cache[prop] = self._db_getstate(prop)
+                    get_thread_running = False
+
+                get_thread = threading.Thread(target=get_job, daemon=True)
+                get_thread.timeout = time.time()+db_timeout
+                get_thread.start()
+
+                while get_thread.is_alive() and time.time() < get_thread.timeout:
+                    time.sleep(0.01)
+
+                if get_thread.is_alive():
+                    return self.getstate_cache[prop]
                 else:
-                    if self.is_service:
-                        if prop in self.state_db:
-                            return self.state_db[prop]
-                        else:
-                            return None
-                    else:
-                        try:
-                            if self.rpc_connection == None:
-                                self.rpc_connection = multiprocessing.connection.Client(self.rpc_addr, authkey=self.rpc_key)
-                            self.rpc_connection.send({"getstate": prop})
-                            response = self.rpc_connection.recv()
-                            # TODO: Remove
-                            # RNS.log("RPC getstate result for "+str(prop)+"="+str(response)+" in "+RNS.prettytime(time.time()-us), RNS.LOG_WARNING)
-                            return response
+                    return self.getstate_cache[prop]
 
-                        except Exception as e:
-                            RNS.log("Error while retrieving state "+str(prop)+" over RPC: "+str(e), RNS.LOG_DEBUG)
-                            self.rpc_connection = None
-                            return None
-    
-    def __start_rpc_listener(self):
-        try:
-            RNS.log("Starting RPC listener", RNS.LOG_DEBUG)
-            self.rpc_listener = multiprocessing.connection.Listener(self.rpc_addr, authkey=self.rpc_key)
-            thread = threading.Thread(target=self.__rpc_loop)
-            thread.daemon = True
-            thread.start()
-        except Exception as e:
-            RNS.log("Could not start RPC listener on "+str(self.rpc_addr)+". Terminating now. Clear up anything using the port and try again.", RNS.LOG_ERROR)
-            RNS.panic()
 
-    def __rpc_loop(self):
-        while True:
-            try:
-                RNS.log("Ready for next RPC client", RNS.LOG_DEBUG)
-                rpc_connection = self.rpc_listener.accept()
-                RNS.log("Accepted RPC client", RNS.LOG_DEBUG)
-                
-                def job_factory(connection):
-                    def rpc_client_job():
-                        try:
-                            while connection:
-                                call = connection.recv()
-                                if "getstate" in call:
-                                    prop = call["getstate"]
-                                    connection.send(self.getstate(prop))
-                                elif "setstate" in call:
-                                    prop, val = call["setstate"]
-                                    connection.send(self.setstate(prop, val))
-                                elif "latest_telemetry" in call:
-                                    t,p = call["latest_telemetry"]
-                                    self.latest_telemetry = t
-                                    self.latest_packed_telemetry = p
-                                    connection.send(True)
-                                elif "set_debug" in call:
-                                    self.service_rpc_set_debug(call["set_debug"])
-                                    connection.send(True)
-
-                        except Exception as e:
-                            RNS.log("Error on client RPC connection: "+str(e), RNS.LOG_ERROR)
-                            try:
-                                connection.close()
-                            except:
-                                pass
-
-                    return rpc_client_job
-
-                threading.Thread(target=job_factory(rpc_connection), daemon=True).start()
-
-            except Exception as e:
-                RNS.log("An error ocurred while handling RPC call from local client: "+str(e), RNS.LOG_ERROR)
 
 
     def setpersistent(self, prop, val):
@@ -1333,27 +792,42 @@ class SidebandCore():
     def __event_conversation_changed(self, context_dest):
         pass
 
-    def __db_connect(self):
+    # kjb dispatch - unused
+    def ios_do_db(self):
         if self.db == None:
+            # original
             self.db = sqlite3.connect(self.db_path, check_same_thread=False)
+            # kjb ios test
+            #self.db = sqlite3.connect(self.db_path, check_same_thread=True)
 
         return self.db
+        
+    def __db_connect(self):
+
+    # kjb dispatch - unused
+        #dispatch_ios.dispatch_serial_kb.dispatch(self.ios_do_db())
+#        if self.db == None:
+#            # original
+#            self.db = sqlite3.connect(self.db_path, check_same_thread=False)
+#            # kjb ios test
+#            #self.db = sqlite3.connect(self.db_path, check_same_thread=True)
+        db = sqlite3.connect(self.db_path, check_same_thread=False)
+
+#        return self.db
+        return db
 
     def __db_init(self):
         db = self.__db_connect()
         dbc = db.cursor()
 
         dbc.execute("DROP TABLE IF EXISTS lxm")
-        dbc.execute("CREATE TABLE lxm (lxm_hash BLOB PRIMARY KEY, dest BLOB, source BLOB, title BLOB, tx_ts INTEGER, rx_ts INTEGER, state INTEGER, method INTEGER, t_encrypted INTEGER, t_encryption INTEGER, data BLOB, extra BLOB)")
+        dbc.execute("CREATE TABLE lxm (lxm_hash BLOB PRIMARY KEY, dest BLOB, source BLOB, title BLOB, tx_ts INTEGER, rx_ts INTEGER, state INTEGER, method INTEGER, t_encrypted INTEGER, t_encryption INTEGER, data BLOB)")
 
         dbc.execute("DROP TABLE IF EXISTS conv")
         dbc.execute("CREATE TABLE conv (dest_context BLOB PRIMARY KEY, last_tx INTEGER, last_rx INTEGER, unread INTEGER, type INTEGER, trust INTEGER, name BLOB, data BLOB)")
 
         dbc.execute("DROP TABLE IF EXISTS announce")
         dbc.execute("CREATE TABLE announce (id PRIMARY KEY, received INTEGER, source BLOB, data BLOB, dest_type BLOB)")
-
-        dbc.execute("DROP TABLE IF EXISTS telemetry")
-        dbc.execute("CREATE TABLE IF NOT EXISTS telemetry (id INTEGER PRIMARY KEY, dest_context BLOB, ts INTEGER, data BLOB)")
 
         dbc.execute("DROP TABLE IF EXISTS state")
         dbc.execute("CREATE TABLE state (property BLOB PRIMARY KEY, value BLOB)")
@@ -1371,92 +845,75 @@ class SidebandCore():
         dbc.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_dest_context ON conv(dest_context)")
         db.commit()
 
-    def _db_inittelemetry(self):
-        db = self.__db_connect()
-        dbc = db.cursor()
-
-        dbc.execute("CREATE TABLE IF NOT EXISTS telemetry (id INTEGER PRIMARY KEY, dest_context BLOB, ts INTEGER, data BLOB)")
-        db.commit()
-
-    def _db_upgradetables(self):
-        # TODO: Remove this again at some point in the future
-        db = self.__db_connect()
-        dbc = db.cursor()
-        dbc.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lxm' AND sql LIKE '%extra%'")
-        result = dbc.fetchall()
-        if len(result) == 0:
-            dbc.execute("ALTER TABLE lxm ADD COLUMN extra BLOB")
-        db.commit()
-
     def _db_initstate(self):
-        # db = self.__db_connect()
-        # dbc = db.cursor()
+        db = self.__db_connect()
+        dbc = db.cursor()
 
-        # dbc.execute("DROP TABLE IF EXISTS state")
-        # dbc.execute("CREATE TABLE state (property BLOB PRIMARY KEY, value BLOB)")
-        # db.commit()
-        self.setstate("database_ready", True)
+        dbc.execute("DROP TABLE IF EXISTS state")
+        dbc.execute("CREATE TABLE state (property BLOB PRIMARY KEY, value BLOB)")
+        db.commit()
+        self._db_setstate("database_ready", True)
 
-    # def _db_getstate(self, prop):
-    #     try:
-    #         db = self.__db_connect()
-    #         dbc = db.cursor()
+    def _db_getstate(self, prop):
+        try:
+            db = self.__db_connect()
+            dbc = db.cursor()
 
-    #         query = "select * from state where property=:uprop"
-    #         dbc.execute(query, {"uprop": prop.encode("utf-8")})
+            query = "select * from state where property=:uprop"
+            dbc.execute(query, {"uprop": prop.encode("utf-8")})
             
-    #         result = dbc.fetchall()
+            result = dbc.fetchall()
 
-    #         if len(result) < 1:
-    #             return None
-    #         else:
-    #             try:
-    #                 entry = result[0]
-    #                 val = msgpack.unpackb(entry[1])
+            if len(result) < 1:
+                return None
+            else:
+                try:
+                    entry = result[0]
+                    val = msgpack.unpackb(entry[1])
                     
-    #                 return val
-    #             except Exception as e:
-    #                 RNS.log("Could not unpack state value from database for property \""+str(prop)+"\". The contained exception was: "+str(e), RNS.LOG_ERROR)
-    #                 return None
+                    return val
+                except Exception as e:
+                    RNS.log("Could not unpack state value from database for property \""+str(prop)+"\". The contained exception was: "+str(e), RNS.LOG_ERROR)
+                    return None
 
-    #     except Exception as e:
-    #         RNS.log("An error occurred during getstate database operation: "+str(e), RNS.LOG_ERROR)
-    #         self.db = None
+        except Exception as e:
+            RNS.log("An error occurred during getstate database operation: "+str(e), RNS.LOG_ERROR)
+            self.db = None
 
-    # def _db_setstate(self, prop, val):
-    #     try:
-    #         uprop = prop.encode("utf-8")
-    #         bval = msgpack.packb(val)
+    def _db_setstate(self, prop, val):
+        try:
+            uprop = prop.encode("utf-8")
+            bval = msgpack.packb(val)
 
-    #         if self._db_getstate(prop) == None:
-    #             try:
-    #                 db = self.__db_connect()
-    #                 dbc = db.cursor()
-    #                 query = "INSERT INTO state (property, value) values (?, ?)"
-    #                 data = (uprop, bval)
-    #                 dbc.execute(query, data)
-    #                 db.commit()
+            if self._db_getstate(prop) == None:
+                try:
+                    db = self.__db_connect()
+                    dbc = db.cursor()
+                    query = "INSERT INTO state (property, value) values (?, ?)"
+                    data = (uprop, bval)
+                    dbc.execute(query, data)
+                    db.commit()
 
-    #             except Exception as e:
-    #                 RNS.log("Error while setting state property "+str(prop)+" in DB: "+str(e), RNS.LOG_ERROR)
-    #                 RNS.log("Retrying as update query...", RNS.LOG_ERROR)
-    #                 db = self.__db_connect()
-    #                 dbc = db.cursor()
-    #                 query = "UPDATE state set value=:bval where property=:uprop;"
-    #                 dbc.execute(query, {"bval": bval, "uprop": uprop})
-    #                 db.commit()
+                except Exception as e:
+                    RNS.log("Error while setting state property "+str(prop)+" in DB: "+str(e), RNS.LOG_ERROR)
+                    RNS.log("Retrying as update query...", RNS.LOG_ERROR)
+                    db = self.__db_connect()
+                    dbc = db.cursor()
+                    query = "UPDATE state set value=:bval where property=:uprop;"
+                    dbc.execute(query, {"bval": bval, "uprop": uprop})
+                    db.commit()
 
-    #         else:
-    #             db = self.__db_connect()
-    #             dbc = db.cursor()
-    #             query = "UPDATE state set value=:bval where property=:uprop;"
-    #             dbc.execute(query, {"bval": bval, "uprop": uprop})
-    #             db.commit()
+            else:
+                db = self.__db_connect()
+                dbc = db.cursor()
+                query = "UPDATE state set value=:bval where property=:uprop;"
+                dbc.execute(query, {"bval": bval, "uprop": uprop})
+                db.commit()
 
 
-    #     except Exception as e:
-    #         RNS.log("An error occurred during setstate database operation: "+str(e), RNS.LOG_ERROR)
-    #         self.db = None
+        except Exception as e:
+            RNS.log("An error occurred during setstate database operation: "+str(e), RNS.LOG_ERROR)
+            self.db = None
 
     def _db_initpersistent(self):
         db = self.__db_connect()
@@ -1524,274 +981,12 @@ class SidebandCore():
             RNS.log("An error occurred during persistent setstate database operation: "+str(e), RNS.LOG_ERROR)
             self.db = None
 
-    def _db_conversation_update_txtime(self, context_dest):
-        db = self.__db_connect()
-        dbc = db.cursor()
-
-        query = "UPDATE conv set last_tx = ? where dest_context = ?"
-        data = (time.time(), context_dest)
-
-        dbc.execute(query, data)
-        result = dbc.fetchall()
-        db.commit()
-
-    def _db_conversation_set_unread(self, context_dest, unread, tx = False):
+    def _db_conversation_set_unread(self, context_dest, unread):
         db = self.__db_connect()
         dbc = db.cursor()
         
-        if unread:
-            if tx:
-                query = "UPDATE conv set unread = ?, last_tx = ? where dest_context = ?"
-                data = (unread, time.time(), context_dest)
-            else:
-                query = "UPDATE conv set unread = ?, last_rx = ? where dest_context = ?"
-                data = (unread, time.time(), context_dest)
-        else:
-            query = "UPDATE conv set unread = ? where dest_context = ?"
-            data = (unread, context_dest)
-
-        dbc.execute(query, data)
-        result = dbc.fetchall()
-        db.commit()
-
-    def _db_telemetry(self, context_dest = None, after = None, before = None, limit = None):
-        db = self.__db_connect()
-        dbc = db.cursor()
-
-        limit_part = ""
-        if limit:
-            limit_part = " LIMIT "+str(int(limit))
-        order_part = " order by ts DESC"+limit_part
-        if context_dest == None:
-            if after != None and before == None:
-                query = "select * from telemetry where ts>:after_ts"+order_part
-                dbc.execute(query, {"after_ts": after})
-            elif after == None and before != None:
-                query = "select * from telemetry where ts<:before_ts"+order_part
-                dbc.execute(query, {"before_ts": before})
-            elif after != None and before != None:
-                query = "select * from telemetry where ts<:before_ts and ts>:after_ts"+order_part
-                dbc.execute(query, {"before_ts": before, "after_ts": after})
-            else:
-                query = query = "select * from telemetry"
-                dbc.execute(query, {})
-
-        else:        
-            if after != None and before == None:
-                query = "select * from telemetry where dest_context=:context_dest and ts>:after_ts"+order_part
-                dbc.execute(query, {"context_dest": context_dest, "after_ts": after})
-            elif after == None and before != None:
-                query = "select * from telemetry where dest_context=:context_dest and ts<:before_ts"+order_part
-                dbc.execute(query, {"context_dest": context_dest, "before_ts": before})
-            elif after != None and before != None:
-                query = "select * from telemetry where dest_context=:context_dest and ts<:before_ts and ts>:after_ts"+order_part
-                dbc.execute(query, {"context_dest": context_dest, "before_ts": before, "after_ts": after})
-            else:
-                query = query = "select * from telemetry where dest_context=:context_dest"+order_part
-                dbc.execute(query, {"context_dest": context_dest})
-
-        result = dbc.fetchall()
-
-        if len(result) < 1:
-            return None
-        else:
-            results = {}
-            for entry in result:
-                telemetry_source = entry[1]
-                telemetry_timestamp = entry[2]
-                telemetry_data = entry[3]
-                
-                if not telemetry_source in results:
-                    results[telemetry_source] = []
-
-                results[telemetry_source].append([telemetry_timestamp, telemetry_data])
-            
-            return results
-
-    def _db_save_telemetry(self, context_dest, telemetry, physical_link = None, source_dest = None, via = None):
-        try:
-            remote_telemeter = Telemeter.from_packed(telemetry)
-            read_telemetry = remote_telemeter.read_all()
-            telemetry_timestamp = read_telemetry["time"]["utc"]
-
-            db = self.__db_connect()
-            dbc = db.cursor()
-
-            query = "select * from telemetry where dest_context=:ctx and ts=:tts"
-            dbc.execute(query, {"ctx": context_dest, "tts": telemetry_timestamp})
-            result = dbc.fetchall()
-
-            if len(result) != 0:
-                RNS.log("Telemetry entry with source "+RNS.prettyhexrep(context_dest)+" and timestamp "+str(telemetry_timestamp)+" already exists, skipping save", RNS.LOG_DEBUG)
-                return None
-
-            if physical_link != None and len(physical_link) != 0:
-                remote_telemeter.synthesize("physical_link")
-                if "rssi" in physical_link: remote_telemeter.sensors["physical_link"].rssi = physical_link["rssi"]
-                if "snr" in physical_link: remote_telemeter.sensors["physical_link"].snr = physical_link["snr"]
-                if "q" in physical_link: remote_telemeter.sensors["physical_link"].q = physical_link["q"]
-                remote_telemeter.sensors["physical_link"].update_data()
-                telemetry = remote_telemeter.packed()
-
-            if source_dest != None:
-                remote_telemeter.synthesize("received")
-                remote_telemeter.sensors["received"].by = self.lxmf_destination.hash
-                remote_telemeter.sensors["received"].via = source_dest
-
-                rl = remote_telemeter.read("location")
-                if rl and "latitude" in rl and "longitude" in rl and "altitude" in rl:
-                    if self.latest_telemetry != None and "location" in self.latest_telemetry:
-                        ol = self.latest_telemetry["location"]
-                        if "latitude" in ol and "longitude" in ol and "altitude" in ol:
-                            olat = ol["latitude"]; olon = ol["longitude"]; oalt = ol["altitude"]
-                            rlat = rl["latitude"]; rlon = rl["longitude"]; ralt = rl["altitude"]
-                            if olat != None and olon != None and oalt != None:
-                                if rlat != None and rlon != None and ralt != None:
-                                    remote_telemeter.sensors["received"].set_distance(
-                                        (olat, olon, oalt), (rlat, rlon, ralt)
-                                    )
-
-                remote_telemeter.sensors["received"].update_data()
-                telemetry = remote_telemeter.packed()
-
-            if via != None:
-                if not "received" in remote_telemeter.sensors:
-                    remote_telemeter.synthesize("received")
-
-                if "by" in remote_telemeter.sensors["received"].data:
-                    remote_telemeter.sensors["received"].by = remote_telemeter.sensors["received"].data["by"]
-                if "distance" in remote_telemeter.sensors["received"].data:
-                    remote_telemeter.sensors["received"].geodesic_distance = remote_telemeter.sensors["received"].data["distance"]["geodesic"]
-                    remote_telemeter.sensors["received"].euclidian_distance = remote_telemeter.sensors["received"].data["distance"]["euclidian"]
-
-                remote_telemeter.sensors["received"].via = via
-                remote_telemeter.sensors["received"].update_data()
-                telemetry = remote_telemeter.packed()
-                
-            query = "INSERT INTO telemetry (dest_context, ts, data) values (?, ?, ?)"
-            data = (context_dest, telemetry_timestamp, telemetry)
-            dbc.execute(query, data)
-            db.commit()
-            self.setstate("app.flags.last_telemetry", time.time())
-
-            return telemetry
-
-        except Exception as e:
-            RNS.log("An error occurred while saving telemetry to database: "+str(e), RNS.LOG_ERROR)
-            self.db = None
-
-    def _db_update_appearance(self, context_dest, timestamp, appearance, from_bulk_telemetry=False):
-        conv = self._db_conversation(context_dest)
-
-        if conv == None:
-            ae = [appearance, int(time.time())]
-            # TODO: Clean out these temporary values at some interval.
-            # Probably expire after 14 days or so.
-            self.setpersistent("temp.peer_appearance."+RNS.hexrep(context_dest, delimit=False), ae)
-        
-        else:
-            data_dict = conv["data"]
-            if data_dict == None:
-                data_dict = {}
-
-            if not "appearance" in data_dict:
-                data_dict["appearance"] = None
-
-            if from_bulk_telemetry and data_dict["appearance"] != SidebandCore.DEFAULT_APPEARANCE:
-                RNS.log("Aborting appearance update from bulk transfer, since conversation already has appearance set: "+str(appearance)+" / "+str(data_dict["appearance"]), RNS.LOG_DEBUG)
-                return
-
-            if data_dict["appearance"] != appearance:
-                data_dict["appearance"] = appearance
-                packed_dict = msgpack.packb(data_dict)
-            
-                db = self.__db_connect()
-                dbc = db.cursor()
-            
-                query = "UPDATE conv set data = ? where dest_context = ?"
-                data = (packed_dict, context_dest)
-                dbc.execute(query, data)
-                result = dbc.fetchall()
-                db.commit()
-
-    def _db_get_appearance(self, context_dest, conv = None, raw=False):
-        if context_dest == self.lxmf_destination.hash:
-            return [self.config["telemetry_icon"], self.config["telemetry_fg"], self.config["telemetry_bg"]]
-        else:
-            data_dict = None
-            if conv != None:
-                data_dict = conv["data"]
-
-            else:
-                conv = self._db_conversation(context_dest)
-                if conv != None:
-                    data_dict = conv["data"]
-                else:
-                    data_dict = {}
-
-            if data_dict != None:
-                if not "appearance" in data_dict or data_dict["appearance"] == None:
-                    apd = self.getpersistent("temp.peer_appearance."+RNS.hexrep(context_dest, delimit=False))
-                    if apd != None:
-                        try:
-                            data_dict["appearance"] = apd[0]
-                        except Exception as e:
-                            RNS.log("Could not get appearance data from database: "+str(e),RNS.LOG_ERROR)
-                            data_dict = None
-
-                try:
-                    if data_dict != None and "appearance" in data_dict:
-                        def htf(cbytes):
-                            d = 1.0/255.0
-                            r = round(struct.unpack("!B", bytes([cbytes[0]]))[0]*d, 4)
-                            g = round(struct.unpack("!B", bytes([cbytes[1]]))[0]*d, 4)
-                            b = round(struct.unpack("!B", bytes([cbytes[2]]))[0]*d, 4)
-                            return [r,g,b]
-
-                        if raw:
-                            appearance = data_dict["appearance"]
-                        else:
-                            appearance = [data_dict["appearance"][0], htf(data_dict["appearance"][1]), htf(data_dict["appearance"][2])]
-                        
-                        return appearance
-                except Exception as e:
-                    RNS.log("Could not retrieve appearance for "+RNS.prettyhexrep(context_dest)+": "+str(e), RNS.LOG_ERROR)
-
-        return None
-
-
-    def _db_conversation_set_telemetry(self, context_dest, send_telemetry=False):
-        conv = self._db_conversation(context_dest)
-        data_dict = conv["data"]
-        if data_dict == None:
-            data_dict = {}
-
-        data_dict["telemetry"] = send_telemetry
-        packed_dict = msgpack.packb(data_dict)
-        
-        db = self.__db_connect()
-        dbc = db.cursor()
-        
-        query = "UPDATE conv set data = ? where dest_context = ?"
-        data = (packed_dict, context_dest)
-        dbc.execute(query, data)
-        result = dbc.fetchall()
-        db.commit()
-
-    def _db_conversation_set_requests(self, context_dest, allow_requests=False):
-        conv = self._db_conversation(context_dest)
-        data_dict = conv["data"]
-        if data_dict == None:
-            data_dict = {}
-
-        data_dict["allow_requests"] = allow_requests
-        packed_dict = msgpack.packb(data_dict)
-        
-        db = self.__db_connect()
-        dbc = db.cursor()
-        
-        query = "UPDATE conv set data = ? where dest_context = ?"
-        data = (packed_dict, context_dest)
+        query = "UPDATE conv set unread = ? where dest_context = ?"
+        data = (unread, context_dest)
         dbc.execute(query, data)
         result = dbc.fetchall()
         db.commit()
@@ -1827,27 +1022,13 @@ class SidebandCore():
         else:
             convs = []
             for entry in result:
-                last_rx = entry[1]
-                last_tx = entry[2]
-                last_activity = max(last_rx, last_tx)
-                data = None
-                try:
-                    data = msgpack.unpackb(entry[7])
-                except:
-                    pass
-
                 conv = {
                     "dest": entry[0],
                     "unread": entry[3],
-                    "last_rx": last_rx,
-                    "last_tx": last_tx,
-                    "last_activity": last_activity,
-                    "trust": entry[5],
-                    "data": data,
                 }
                 convs.append(conv)
 
-            return sorted(convs, key=lambda c: c["last_activity"], reverse=True)
+            return convs
 
     def _db_announces(self):
         db = self.__db_connect()
@@ -1899,7 +1080,6 @@ class SidebandCore():
             conv["trust"] = c[5]
             conv["name"] = c[6].decode("utf-8")
             conv["data"] = msgpack.unpackb(c[7])
-            conv["last_activity"] = max(c[1], c[2])
             return conv
 
     def _db_clear_conversation(self, context_dest):
@@ -1910,17 +1090,6 @@ class SidebandCore():
         query = "delete from lxm where (dest=:ctx_dst or source=:ctx_dst);"
         dbc.execute(query, {"ctx_dst": context_dest})
         db.commit()
-
-    def _db_clear_telemetry(self, context_dest):
-        RNS.log("Clearing telemetry for "+RNS.prettyhexrep(context_dest), RNS.LOG_DEBUG)
-        db = self.__db_connect()
-        dbc = db.cursor()
-
-        query = "delete from telemetry where dest_context=:ctx_dst;"
-        dbc.execute(query, {"ctx_dst": context_dest})
-        db.commit()
-
-        self.setstate("app.flags.last_telemetry", time.time())
 
     def _db_delete_conversation(self, context_dest):
         RNS.log("Deleting conversation with "+RNS.prettyhexrep(context_dest), RNS.LOG_DEBUG)
@@ -1948,7 +1117,7 @@ class SidebandCore():
 
         def_name = "".encode("utf-8")
         query = "INSERT INTO conv (dest_context, last_tx, last_rx, unread, type, trust, name, data) values (?, ?, ?, ?, ?, ?, ?, ?)"
-        data = (context_dest, 0, time.time(), 0, SidebandCore.CONV_P2P, 0, def_name, msgpack.packb(None))
+        data = (context_dest, 0, 0, 0, SidebandCore.CONV_P2P, 0, def_name, msgpack.packb(None))
 
         dbc.execute(query, data)
         db.commit()
@@ -2092,12 +1261,6 @@ class SidebandCore():
                 
                 if lxm.desired_method == LXMF.LXMessage.PAPER:
                     lxm.paper_packed = paper_packed_lxm
-
-                extras = None
-                try:
-                    extras = msgpack.unpackb(entry[11])
-                except:
-                    pass
                 
                 message = {
                     "hash": lxm.hash,
@@ -2109,8 +1272,7 @@ class SidebandCore():
                     "sent": lxm.timestamp,
                     "state": entry[6],
                     "method": entry[7],
-                    "lxm": lxm,
-                    "extras": extras,
+                    "lxm": lxm
                 }
 
                 messages.append(message)
@@ -2118,88 +1280,40 @@ class SidebandCore():
                 messages = messages[-limit:]
             return messages
 
-    def _db_save_lxm(self, lxm, context_dest, originator = False, own_command = False):
+    def _db_save_lxm(self, lxm, context_dest):    
         state = lxm.state
 
-        packed_telemetry = None
-        if not originator and lxm.fields != None:
-            if self.config["telemetry_receive_trusted_only"] == False or (self.config["telemetry_receive_trusted_only"] == True and self.is_trusted(context_dest)):
-                if LXMF.FIELD_ICON_APPEARANCE in lxm.fields:
-                    peer_appearance = lxm.fields[LXMF.FIELD_ICON_APPEARANCE]
-                    if peer_appearance != None and len(peer_appearance) > 0 and len(peer_appearance) < 96:
-                        self._db_update_appearance(context_dest, lxm.timestamp, peer_appearance)
+        db = self.__db_connect()
+        dbc = db.cursor()
 
-                if LXMF.FIELD_TELEMETRY in lxm.fields:
-                    physical_link = {}
-                    if lxm.rssi or lxm.snr or lxm.q:
-                        physical_link["rssi"] = lxm.rssi
-                        physical_link["snr"] = lxm.snr
-                        physical_link["q"] = lxm.q
-                    packed_telemetry = self._db_save_telemetry(context_dest, lxm.fields[LXMF.FIELD_TELEMETRY], physical_link=physical_link, source_dest=context_dest)
+        if not lxm.packed:
+            lxm.pack()
 
-                if LXMF.FIELD_TELEMETRY_STREAM in lxm.fields:
-                    max_timebase = self.getpersistent(f"telemetry.{RNS.hexrep(context_dest, delimit=False)}.timebase") or 0
-                    if lxm.fields[LXMF.FIELD_TELEMETRY_STREAM] != None and len(lxm.fields[LXMF.FIELD_TELEMETRY_STREAM]) > 0:
-                        for telemetry_entry in lxm.fields[LXMF.FIELD_TELEMETRY_STREAM]:
-                            tsource = telemetry_entry[0]
-                            ttstamp = telemetry_entry[1]
-                            tpacked = telemetry_entry[2]
-                            appearance = telemetry_entry[3]
-                            max_timebase = max(max_timebase, ttstamp)
-                            if self._db_save_telemetry(tsource, tpacked, via = context_dest):
-                                RNS.log("Saved telemetry stream entry from "+RNS.prettyhexrep(tsource), RNS.LOG_DEBUG)
-                                if appearance != None:
-                                    self._db_update_appearance(tsource, ttstamp, appearance, from_bulk_telemetry=True)
-                                    RNS.log("Updated appearance entry from "+RNS.prettyhexrep(tsource), RNS.LOG_DEBUG)
+        if lxm.method == LXMF.LXMessage.PAPER:
+            packed_lxm = msgpack.packb([lxm.packed, lxm.paper_packed])
+        else:
+            packed_lxm = lxm.packed
 
-                        self.setpersistent(f"telemetry.{RNS.hexrep(context_dest, delimit=False)}.timebase", max_timebase)
+        query = "INSERT INTO lxm (lxm_hash, dest, source, title, tx_ts, rx_ts, state, method, t_encrypted, t_encryption, data) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        data = (
+            lxm.hash,
+            lxm.destination_hash,
+            lxm.source_hash,
+            lxm.title,
+            lxm.timestamp,
+            time.time(),
+            state,
+            lxm.method,
+            lxm.transport_encrypted,
+            lxm.transport_encryption,
+            packed_lxm,
+        )
 
-                    else:
-                        RNS.log("Received telemetry stream field with no data: "+str(lxm.fields[LXMF.FIELD_TELEMETRY_STREAM]), RNS.LOG_DEBUG)
+        dbc.execute(query, data)
 
-        if own_command or len(lxm.content) != 0 or len(lxm.title) != 0:
-            db = self.__db_connect()
-            dbc = db.cursor()
+        db.commit()
 
-            if not lxm.packed:
-                lxm.pack()
-
-            if lxm.method == LXMF.LXMessage.PAPER:
-                packed_lxm = msgpack.packb([lxm.packed, lxm.paper_packed])
-            else:
-                packed_lxm = lxm.packed
-
-            extras = {}
-            if lxm.rssi or lxm.snr or lxm.q:
-                extras["rssi"] = lxm.rssi
-                extras["snr"] = lxm.snr
-                extras["q"] = lxm.q
-
-            if packed_telemetry != None:
-                extras["packed_telemetry"] = packed_telemetry
-
-            extras = msgpack.packb(extras)
-
-            query = "INSERT INTO lxm (lxm_hash, dest, source, title, tx_ts, rx_ts, state, method, t_encrypted, t_encryption, data, extra) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            data = (
-                lxm.hash,
-                lxm.destination_hash,
-                lxm.source_hash,
-                lxm.title,
-                lxm.timestamp,
-                time.time(),
-                state,
-                lxm.method,
-                lxm.transport_encrypted,
-                lxm.transport_encryption,
-                packed_lxm,
-                extras
-            )
-
-            dbc.execute(query, data)
-            db.commit()
-
-            self.__event_conversation_changed(context_dest)
+        self.__event_conversation_changed(context_dest)
 
     def _db_save_announce(self, destination_hash, app_data, dest_type="lxmf.delivery"):
         db = self.__db_connect()
@@ -2233,152 +1347,17 @@ class SidebandCore():
             self.last_lxmf_announce = time.time()
             self.next_auto_announce = time.time() + 60*(random.random()*(SidebandCore.AUTO_ANNOUNCE_RANDOM_MAX-SidebandCore.AUTO_ANNOUNCE_RANDOM_MIN))
             RNS.log("Next auto announce in "+RNS.prettytime(self.next_auto_announce-time.time()), RNS.LOG_DEBUG)
+
+            # kjb threading
+            #if RNS.vendor.platformutils.get_platform() == "ios":
+             #   self.sideband_app_main_queue.put(self.setstate("wants.announce", False))
+            #else:
             self.setstate("wants.announce", False)
         else:
+            #if RNS.vendor.platformutils.get_platform() == "ios":
+             #   self.sideband_app_main_queue.put(self.setstate("wants.announce", True))
+            #else:
             self.setstate("wants.announce", True)
-
-    def run_telemetry(self):
-        if not self.telemetry_running:
-            self.telemetry_running = True
-            def telemetry_job():
-                while self.telemetry_running:
-                    self.update_telemetry()
-                    time.sleep(SidebandCore.TELEMETRY_INTERVAL)
-
-            threading.Thread(target=telemetry_job, daemon=True).start()
-
-    def run_service_telemetry(self):
-        if not self.telemetry_running:
-            self.telemetry_running = True
-            def telemetry_job():
-                while self.telemetry_running:
-                    try:
-                        if self.owner_service._gps_started:
-                            self.update_telemetry()
-                    except Exception as e:
-                        import traceback
-                        exception_info = "".join(traceback.TracebackException.from_exception(e).format())
-                        RNS.log(f"An {str(type(e))} occurred while updating service telemetry: {str(e)}", RNS.LOG_ERROR)
-                        RNS.log(exception_info, RNS.LOG_ERROR)
-
-                    time.sleep(SidebandCore.SERVICE_TELEMETRY_INTERVAL)
-
-            threading.Thread(target=telemetry_job, daemon=True).start()
-
-    def stop_telemetry(self):
-        self.telemetry_running = False
-        self.telemeter.stop_all()
-        self.update_telemeter_config()
-        self.setstate("app.flags.last_telemetry", time.time())
-
-    def update_telemetry(self):
-        try:
-            telemetry = self.get_telemetry()
-            packed_telemetry = self.get_packed_telemetry()
-            telemetry_changed = False
-
-            if telemetry != None and packed_telemetry != None:
-                if self.latest_telemetry == None or len(telemetry) != len(self.latest_telemetry):
-                    telemetry_changed = True
-
-                for sn in telemetry:
-                    if telemetry_changed:
-                        break
-
-                    if sn != "time":
-                        if sn in self.latest_telemetry:
-                            if telemetry[sn] != self.latest_telemetry[sn]:
-                                telemetry_changed = True
-                        else:
-                            telemetry_changed = True
-
-                if self.latest_telemetry != None:
-                    for sn in self.latest_telemetry:
-                        if telemetry_changed:
-                            break
-
-                        if sn != "time":
-                            if not sn in telemetry:
-                                telemetry_changed = True
-
-                if telemetry_changed:
-                    self.telemetry_changes += 1
-                    self.latest_telemetry = telemetry
-                    self.latest_packed_telemetry = packed_telemetry
-                    self.setstate("app.flags.last_telemetry", time.time())
-
-                    if self.is_client:
-                        try:
-                            self.service_set_latest_telemetry(self.latest_telemetry, self.latest_packed_telemetry)
-                        except Exception as e:
-                            RNS.log("Error while sending latest telemetry to service: "+str(e), RNS.LOG_ERROR)
-
-        except Exception as e:
-            import traceback
-            exception_info = "".join(traceback.TracebackException.from_exception(e).format())
-            RNS.log(f"An {str(type(e))} occurred while updating telemetry: {str(e)}", RNS.LOG_ERROR)
-            RNS.log(exception_info, RNS.LOG_ERROR)
-
-    def update_telemeter_config(self):
-        if self.config["telemetry_enabled"] == True:
-            if self.telemeter == None:
-                if self.service_context == None:
-                    self.telemeter = Telemeter()
-                else:
-                    self.telemeter = Telemeter(android_context=self.service_context, service=True, location_provider=self.owner_service)
-
-            sensors = ["location", "information", "battery", "pressure", "temperature", "humidity", "magnetic_field", "ambient_light", "gravity", "angular_velocity", "acceleration", "proximity"]
-            for sensor in sensors:
-                if self.config["telemetry_s_"+sensor]:
-                    self.telemeter.enable(sensor)
-                else:
-                    if sensor == "location":
-                        if "location" in self.telemeter.sensors:
-                            if self.telemeter.sensors["location"].active:
-                                if self.telemeter.sensors["location"].synthesized:
-                                    if not self.config["telemetry_s_fixed_location"]:
-                                        self.telemeter.disable(sensor)
-                                else:
-                                    self.telemeter.disable(sensor)
-                    else:
-                        self.telemeter.disable(sensor)
-            
-            if self.config["telemetry_s_fixed_location"]:
-                self.telemeter.synthesize("location")
-                self.telemeter.sensors["location"].latitude = self.config["telemetry_s_fixed_latlon"][0]
-                self.telemeter.sensors["location"].longitude = self.config["telemetry_s_fixed_latlon"][1]
-                self.telemeter.sensors["location"].altitude = self.config["telemetry_s_fixed_altitude"]
-                self.telemeter.sensors["location"].stale_time = 30
-
-            if self.config["telemetry_s_information"]:
-                self.telemeter.synthesize("information")
-                self.telemeter.sensors["information"].contents = self.config["telemetry_s_information_text"]
-
-        else:
-            self.telemeter = None
-            self.latest_telemetry = None
-            self.latest_packed_telemetry = None
-
-    def get_telemetry(self):
-        if self.config["telemetry_enabled"] == True:
-            self.update_telemeter_config()
-            if self.telemeter != None:
-                return self.telemeter.read_all()
-            else:
-                return {}
-        else:
-            return {}
-
-    def get_packed_telemetry(self):
-        if self.config["telemetry_enabled"] == True:
-            self.update_telemeter_config()
-            if self.telemeter != None:
-                packed = self.telemeter.packed()
-                return packed
-            else:
-                return None
-        else:
-            return None
 
     def is_known(self, dest_hash):
         try:
@@ -2404,48 +1383,9 @@ class SidebandCore():
     def _service_jobs(self):
         if self.is_service:
             last_usb_discovery = time.time()
-            last_multicast_lock_check = time.time()
             while True:
                 time.sleep(SidebandCore.SERVICE_JOB_INTERVAL)
                 now = time.time()
-                needs_if_change_announce = False
-
-                try:
-                    if hasattr(self, "interface_local"):
-                        if self.interface_local != None:
-                            if self.interface_local.carrier_changed:
-                                RNS.log("AutoInterface carrier change detected, retaking wake locks", RNS.LOG_DEBUG)
-                                self.owner_service.take_locks(force_multicast=True)
-                                self.interface_local.carrier_changed = False
-                                last_multicast_lock_check = now
-                                needs_if_change_announce = True
-                                self.last_if_change_announce = 0
-
-                        if (self.interface_local != None and len(self.interface_local.adopted_interfaces) == 0) or (self.config["connect_local"] and self.interface_local == None):
-                            if not self.interface_local_adding:
-                                RNS.log("No suitable interfaces on AutoInterface, scheduling re-init", RNS.LOG_DEBUG)
-                                if self.interface_local in RNS.Transport.interfaces:
-                                    RNS.Transport.interfaces.remove(self.interface_local)
-                                del self.interface_local
-                                self.interface_local = None
-                                self.interface_local_adding = True
-                                def job():
-                                    self.__add_localinterface(delay=60)
-                                    if self.config["start_announce"] == True:
-                                        time.sleep(12)
-                                        self.lxmf_announce(attached_interface=self.interface_local)
-                                threading.Thread(target=job, daemon=True).start()
-
-                    if (now - last_multicast_lock_check > 120):
-                        RNS.log("Checking multicast and wake locks", RNS.LOG_DEBUG)
-                        self.owner_service.take_locks()
-                        last_multicast_lock_check = now
-
-                except Exception as e:
-                    import traceback
-                    exception_info = "".join(traceback.TracebackException.from_exception(e).format())
-                    RNS.log(f"An {str(type(e))} occurred while running interface checks: {str(e)}", RNS.LOG_ERROR)
-                    RNS.log(exception_info, RNS.LOG_ERROR)
 
                 announce_wanted = self.getstate("wants.announce")
                 announce_attached_interface = None
@@ -2454,8 +1394,14 @@ class SidebandCore():
                 # renamed to "auto_announce", which is its current
                 # meaning.
                 if self.config["start_announce"] == True:
+                    needs_if_change_announce = False
+
                     if hasattr(self, "interface_local") and self.interface_local != None:
                         have_peers = len(self.interface_local.peers) > 0
+                        if self.interface_local.carrier_changed:
+                            RNS.log("AutoInterface carrier change detected, retaking wake locks", RNS.LOG_DEBUG)
+                            self.owner_service.take_locks(force_multicast=True)
+                            self.interface_local.carrier_changed = False
 
                         if hasattr(self.interface_local, "had_peers"):
                             if not self.interface_local.had_peers and have_peers:
@@ -2508,6 +1454,7 @@ class SidebandCore():
 
                 if self.getstate("wants.bt_on"):
                     self.setstate("wants.bt_on", False)
+                    RNS.log("BT Start XXXX " + str(self.owner_app))
                     self.owner_app.discover_usb_devices()
                     self.setstate("executing.bt_on", True)
                     if self.interface_rnode != None:
@@ -2549,7 +1496,7 @@ class SidebandCore():
                                     target_port = self.owner_app.usb_devices[0]["port"]
                                     RNS.Interfaces.Android.RNodeInterface.RNodeInterface.bluetooth_control(port=target_port, pairing_mode = True)
                                 except Exception as e:
-                                    self.setstate("hardware_operation.error", "An error occurred while trying to communicate with the device. Please make sure that Sideband has been granted permissions to access the device.\n\nThe reported error was:\n\n[i]"+str(e)+"[/i]")
+                                    self.setstate("hardware_operation.error", "An error ocurred while trying to communicate with the device. Please make sure that Sideband has been granted permissions to access the device.\n\nThe reported error was:\n\n[i]"+str(e)+"[/i]")                
                             else:
                                 RNS.log("Could not execute RNode Bluetooth control command, no USB devices available", RNS.LOG_ERROR)
                     self.setstate("executing.bt_pair", False)
@@ -2592,8 +1539,6 @@ class SidebandCore():
         if self.is_service or self.is_standalone:
             while True:
                 time.sleep(SidebandCore.PERIODIC_JOBS_INTERVAL)
-                self.owner_service.update_location_provider()
-
                 if self.config["lxmf_periodic_sync"] == True:
                     if self.getpersistent("lxmf.lastsync") == None:
                         self.setpersistent("lxmf.lastsync", time.time())
@@ -2603,8 +1548,8 @@ class SidebandCore():
                         lastsync = self.getpersistent("lxmf.lastsync")
                         nextsync = lastsync+syncinterval
 
-                        RNS.log("Last LXMF sync was "+RNS.prettytime(now-lastsync)+" ago", RNS.LOG_EXTREME)
-                        RNS.log("Next LXMF sync is "+("in "+RNS.prettytime(nextsync-now) if nextsync-now > 0 else "now"), RNS.LOG_EXTREME)
+                        RNS.log("Last sync was "+RNS.prettytime(now-lastsync)+" ago", RNS.LOG_DEBUG)
+                        RNS.log("Next sync is "+("in "+RNS.prettytime(nextsync-now) if nextsync-now > 0 else "now"), RNS.LOG_DEBUG)
                         if now > nextsync:
                             if self.request_lxmf_sync():
                                 RNS.log("Scheduled LXMF sync succeeded", RNS.LOG_DEBUG)
@@ -2620,60 +1565,6 @@ class SidebandCore():
                                     self.setpersistent("lxmf.lastsync", time.time())
                                     self.setpersistent("lxmf.syncretrying", False)
 
-                if self.config["telemetry_enabled"]:
-                    if self.config["telemetry_send_to_collector"]:
-                        if self.config["telemetry_collector"] != None and self.config["telemetry_collector"] != self.lxmf_destination.hash:
-                            try:
-                                now = time.time()
-                                collector_address = self.config["telemetry_collector"]
-                                last_send_timebase = self.getpersistent(f"telemetry.{RNS.hexrep(collector_address, delimit=False)}.last_send_success_timebase") or 0
-                                send_interval = self.config["telemetry_send_interval"]
-                                next_send = last_send_timebase+send_interval
-
-                                scheduled = next_send-now; blocked = self.telemetry_send_blocked_until-now
-                                next_send_in = max(scheduled, blocked)
-                                RNS.log("Last telemetry send was "+RNS.prettytime(now-last_send_timebase)+" ago", RNS.LOG_EXTREME)
-                                RNS.log("Next telemetry send is "+("in "+RNS.prettytime(next_send_in) if next_send_in > 0 else "now"), RNS.LOG_EXTREME)
-
-                                if now > last_send_timebase+send_interval and now > self.telemetry_send_blocked_until:
-                                    RNS.log("Initiating telemetry send to collector", RNS.LOG_DEBUG)
-                                    if not self.pending_telemetry_send_try >= self.pending_telemetry_send_maxtries:
-                                        self.pending_telemetry_send = True
-                                        self.pending_telemetry_send_try += 1
-                                        if self.config["telemetry_send_all_to_collector"]:
-                                            last_timebase = (self.getpersistent(f"telemetry.{RNS.hexrep(collector_address, delimit=False)}.last_send_success_timebase") or 0)
-                                            self.create_telemetry_collector_response(to_addr=collector_address, timebase=last_timebase, is_authorized_telemetry_request=True)
-                                        else:
-                                            self.send_latest_telemetry(to_addr=collector_address)
-                                    else:
-                                        if self.telemetry_send_blocked_until < now:
-                                            next_slot = now+send_interval
-                                            self.telemetry_send_blocked_until = next_slot
-                                            RNS.log(f"Sending telemetry to collector failed after {self.pending_telemetry_send_try} tries.", RNS.LOG_WARNING)
-                                            RNS.log(f"Not scheduling further retries until next send slot in {RNS.prettytime(next_slot-now)}.", RNS.LOG_WARNING)
-                                            self.pending_telemetry_send_try = 0
-
-                            except Exception as e:
-                                RNS.log("An error occurred while sending scheduled telemetry to collector: "+str(e), RNS.LOG_ERROR)
-
-                    if self.config["telemetry_request_from_collector"]:
-                        if self.config["telemetry_collector"] != None and self.config["telemetry_collector"] != self.lxmf_destination.hash:
-                            try:
-                                now = time.time()
-                                collector_address = self.config["telemetry_collector"]
-                                last_request_timebase = self.getpersistent(f"telemetry.{RNS.hexrep(collector_address, delimit=False)}.last_request_success_timebase") or 0
-                                request_interval = self.config["telemetry_request_interval"]
-                                next_request = last_request_timebase+request_interval
-
-                                RNS.log("Last telemetry request was "+RNS.prettytime(now-last_request_timebase)+" ago", RNS.LOG_EXTREME)
-                                RNS.log("Next telemetry request is "+("in "+RNS.prettytime(next_request-now) if next_request-now > 0 else "now"), RNS.LOG_EXTREME)
-
-                                if now > last_request_timebase+request_interval:
-                                    RNS.log("Initiating telemetry request to collector", RNS.LOG_DEBUG)
-
-                            except Exception as e:
-                                RNS.log("An error occurred while requesting scheduled telemetry from collector: "+str(e), RNS.LOG_ERROR)
-
     def __start_jobs_deferred(self):
         if self.is_service:
             self.service_thread = threading.Thread(target=self._service_jobs, daemon=True)
@@ -2681,96 +1572,23 @@ class SidebandCore():
 
         if self.is_standalone or self.is_service:            
             if self.config["start_announce"]:
-                def da():
-                    time.sleep(8)
-                    self.lxmf_announce()
-                    self.last_if_change_announce = time.time()
-                threading.Thread(target=da, daemon=True).start()
+                self.lxmf_announce()
+                self.last_if_change_announce = time.time()
 
             self.periodic_thread = threading.Thread(target=self._periodic_jobs, daemon=True)
             self.periodic_thread.start()
-
-        if self.is_standalone or self.is_client:
-            if self.config["telemetry_enabled"]:
-                self.run_telemetry()
-        elif self.is_service:
-            self.run_service_telemetry()
-
-    def __add_localinterface(self, delay=None):
-        self.interface_local_adding = True
-        if delay:
-            time.sleep(delay)
-
-        try:
-            RNS.log("Adding Auto Interface...", RNS.LOG_DEBUG)
-            if self.config["connect_local_groupid"] == "":
-                group_id = None
-            else:
-                group_id = self.config["connect_local_groupid"]
-
-            if self.config["connect_local_ifac_netname"] == "":
-                ifac_netname = None
-            else:
-                ifac_netname = self.config["connect_local_ifac_netname"]
-
-            if self.config["connect_local_ifac_passphrase"] == "":
-                ifac_netkey = None
-            else:
-                ifac_netkey = self.config["connect_local_ifac_passphrase"]
-
-            autointerface = RNS.Interfaces.AutoInterface.AutoInterface(
-                RNS.Transport,
-                name = "AutoInterface",
-                group_id = group_id
-            )
-            autointerface.OUT = True
-
-            if RNS.Reticulum.transport_enabled():
-                if_mode = Interface.Interface.MODE_FULL
-                if self.config["connect_ifmode_local"] == "gateway":
-                    if_mode = Interface.Interface.MODE_GATEWAY
-                elif self.config["connect_ifmode_local"] == "access point":
-                    if_mode = Interface.Interface.MODE_ACCESS_POINT
-                elif self.config["connect_ifmode_local"] == "roaming":
-                    if_mode = Interface.Interface.MODE_ROAMING
-                elif self.config["connect_ifmode_local"] == "boundary":
-                    if_mode = Interface.Interface.MODE_BOUNDARY
-            else:
-                if_mode = None
-                
-            self.reticulum._add_interface(autointerface, mode = if_mode, ifac_netname = ifac_netname, ifac_netkey = ifac_netkey)
-            self.interface_local = autointerface
-            self.interface_local_adding = False
-
-        except Exception as e:
-            RNS.log("Error while adding AutoInterface. The contained exception was: "+str(e))
-            self.interface_local = None
-            self.interface_local_adding = False
-
-    def _reticulum_log_debug(self, debug=False):
-        self.log_verbose = debug
-        if self.log_verbose:
-            selected_level = 6
-        else:
-            selected_level = 2
-
-        RNS.loglevel = selected_level
-        if self.is_client:
-            self.service_rpc_set_debug(debug)
-
+        
     def __start_jobs_immediate(self):
         if self.log_verbose:
-            selected_level = 6
+            selected_level = 7
         else:
             selected_level = 2
 
         self.setstate("init.loadingstate", "Substantiating Reticulum")
         self.reticulum = RNS.Reticulum(configdir=self.rns_configdir, loglevel=selected_level)
 
-        if self.is_service:
-            self.__start_rpc_listener()
-
-        if RNS.vendor.platformutils.get_platform() == "android":
+        # kjb enable sideband interfaces?
+        if RNS.vendor.platformutils.get_platform() == "android" or RNS.vendor.platformutils.get_platform() == "ios":
             # TODO: Just log to console for, but add option to export log
             # files at some point.
             # if self.config["debug"]:
@@ -2792,7 +1610,49 @@ class SidebandCore():
 
                 if self.config["connect_local"]:
                     self.setstate("init.loadingstate", "Discovering Topography")
-                    self.__add_localinterface()
+                    try:
+                        RNS.log("Adding Auto Interface...", RNS.LOG_DEBUG)
+                        if self.config["connect_local_groupid"] == "":
+                            group_id = None
+                        else:
+                            group_id = self.config["connect_local_groupid"]
+
+                        if self.config["connect_local_ifac_netname"] == "":
+                            ifac_netname = None
+                        else:
+                            ifac_netname = self.config["connect_local_ifac_netname"]
+
+                        if self.config["connect_local_ifac_passphrase"] == "":
+                            ifac_netkey = None
+                        else:
+                            ifac_netkey = self.config["connect_local_ifac_passphrase"]
+
+                        autointerface = RNS.Interfaces.AutoInterface.AutoInterface(
+                            RNS.Transport,
+                            name = "AutoInterface",
+                            group_id = group_id
+                        )
+                        autointerface.OUT = True
+
+                        if RNS.Reticulum.transport_enabled():
+                            if_mode = Interface.RNSInterface.MODE_FULL
+                            if self.config["connect_ifmode_local"] == "gateway":
+                                if_mode = Interface.RNSInterface.MODE_GATEWAY
+                            elif self.config["connect_ifmode_local"] == "access point":
+                                if_mode = Interface.RNSInterface.MODE_ACCESS_POINT
+                            elif self.config["connect_ifmode_local"] == "roaming":
+                                if_mode = Interface.RNSInterface.MODE_ROAMING
+                            elif self.config["connect_ifmode_local"] == "boundary":
+                                if_mode = Interface.RNSInterface.MODE_BOUNDARY
+                        else:
+                            if_mode = None
+                            
+                        self.reticulum._add_interface(autointerface, mode = if_mode, ifac_netname = ifac_netname, ifac_netkey = ifac_netkey)
+                        self.interface_local = autointerface
+
+                    except Exception as e:
+                        RNS.log("Error while adding AutoInterface. The contained exception was: "+str(e))
+                        self.interface_local = None
 
                 if self.config["connect_tcp"]:
                     self.setstate("init.loadingstate", "Connecting TCP Tunnel")
@@ -2814,11 +1674,6 @@ class SidebandCore():
                                 else:
                                     ifac_netkey = self.config["connect_tcp_ifac_passphrase"]
 
-                                if ifac_netname != None or ifac_netkey != None:
-                                    ifac_size = 16
-                                else:
-                                    ifac_size = None
-
                                 tcpinterface = RNS.Interfaces.TCPInterface.TCPClientInterface(
                                     RNS.Transport,
                                     "TCPClientInterface",
@@ -2831,19 +1686,19 @@ class SidebandCore():
                                 tcpinterface.OUT = True
 
                                 if RNS.Reticulum.transport_enabled():
-                                    if_mode = Interface.Interface.MODE_FULL
+                                    if_mode = Interface.RNSInterface.MODE_FULL
                                     if self.config["connect_ifmode_tcp"] == "gateway":
-                                        if_mode = Interface.Interface.MODE_GATEWAY
+                                        if_mode = Interface.RNSInterface.MODE_GATEWAY
                                     elif self.config["connect_ifmode_tcp"] == "access point":
-                                        if_mode = Interface.Interface.MODE_ACCESS_POINT
+                                        if_mode = Interface.RNSInterface.MODE_ACCESS_POINT
                                     elif self.config["connect_ifmode_tcp"] == "roaming":
-                                        if_mode = Interface.Interface.MODE_ROAMING
+                                        if_mode = Interface.RNSInterface.MODE_ROAMING
                                     elif self.config["connect_ifmode_tcp"] == "boundary":
-                                        if_mode = Interface.Interface.MODE_BOUNDARY
+                                        if_mode = Interface.RNSInterface.MODE_BOUNDARY
                                 else:
                                     if_mode = None
                                     
-                                self.reticulum._add_interface(tcpinterface, mode=if_mode, ifac_netname=ifac_netname, ifac_netkey=ifac_netkey, ifac_size=ifac_size)
+                                self.reticulum._add_interface(tcpinterface, mode=if_mode, ifac_netname=ifac_netname, ifac_netkey=ifac_netkey)
                                 self.interface_tcp = tcpinterface
 
                     except Exception as e:
@@ -2866,11 +1721,6 @@ class SidebandCore():
                             else:
                                 ifac_netkey = self.config["connect_i2p_ifac_passphrase"]
 
-                            if ifac_netname != None or ifac_netkey != None:
-                                ifac_size = 16
-                            else:
-                                ifac_size = None
-
                             i2pinterface = RNS.Interfaces.I2PInterface.I2PInterface(
                                 RNS.Transport,
                                 "I2PInterface",
@@ -2882,19 +1732,19 @@ class SidebandCore():
                             i2pinterface.OUT = True
 
                             if RNS.Reticulum.transport_enabled():
-                                if_mode = Interface.Interface.MODE_FULL
+                                if_mode = Interface.RNSInterface.MODE_FULL
                                 if self.config["connect_ifmode_i2p"] == "gateway":
-                                    if_mode = Interface.Interface.MODE_GATEWAY
+                                    if_mode = Interface.RNSInterface.MODE_GATEWAY
                                 elif self.config["connect_ifmode_i2p"] == "access point":
-                                    if_mode = Interface.Interface.MODE_ACCESS_POINT
+                                    if_mode = Interface.RNSInterface.MODE_ACCESS_POINT
                                 elif self.config["connect_ifmode_i2p"] == "roaming":
-                                    if_mode = Interface.Interface.MODE_ROAMING
+                                    if_mode = Interface.RNSInterface.MODE_ROAMING
                                 elif self.config["connect_ifmode_i2p"] == "boundary":
-                                    if_mode = Interface.Interface.MODE_BOUNDARY
+                                    if_mode = Interface.RNSInterface.MODE_BOUNDARY
                             else:
                                 if_mode = None
                                 
-                            self.reticulum._add_interface(i2pinterface, mode = if_mode, ifac_netname=ifac_netname, ifac_netkey=ifac_netkey, ifac_size=ifac_size)
+                            self.reticulum._add_interface(i2pinterface, mode = if_mode, ifac_netname=ifac_netname, ifac_netkey=ifac_netkey)
                             
                             for si in RNS.Transport.interfaces:
                                 if type(si) == RNS.Interfaces.I2PInterface.I2PInterfacePeer:
@@ -2921,20 +1771,24 @@ class SidebandCore():
                             target_port = None
                     
                         bt_device_name = None
-                        rnode_allow_bluetooth = False
-                        if self.getpersistent("permissions.bluetooth"):
-                            if self.config["hw_rnode_bluetooth"]:
-                                RNS.log("Allowing RNode bluetooth", RNS.LOG_DEBUG)
-                                rnode_allow_bluetooth = True
-                                if self.config["hw_rnode_bt_device"] != None:
-                                    bt_device_name = self.config["hw_rnode_bt_device"]
-
-                            else:
-                                RNS.log("Disallowing RNode bluetooth since config is disabled", RNS.LOG_DEBUG)
-                                rnode_allow_bluetooth = False
+                        # on iOS rely on automatic permission check when pairing for now? kjb todo
+                        if RNS.vendor.platformutils.get_platform() == "ios":
+                            rnode_allow_bluetooth = True
                         else:
-                            RNS.log("Disallowing RNode bluetooth due to missing permission", RNS.LOG_DEBUG)
                             rnode_allow_bluetooth = False
+                            if self.getpersistent("permissions.bluetooth"):
+                                if self.config["hw_rnode_bluetooth"]:
+                                    RNS.log("Allowing RNode bluetooth", RNS.LOG_DEBUG)
+                                    rnode_allow_bluetooth = True
+                                    if self.config["hw_rnode_bt_device"] != None:
+                                        bt_device_name = self.config["hw_rnode_bt_device"]
+
+                                else:
+                                    RNS.log("Disallowing RNode bluetooth since config is disabled", RNS.LOG_DEBUG)
+                                    rnode_allow_bluetooth = False
+                            else:
+                                RNS.log("Disallowing RNode bluetooth due to missing permission", RNS.LOG_DEBUG)
+                                rnode_allow_bluetooth = False
 
                         if self.config["connect_rnode_ifac_netname"] == "":
                             ifac_netname = None
@@ -2946,65 +1800,100 @@ class SidebandCore():
                         else:
                             ifac_netkey = self.config["connect_rnode_ifac_passphrase"]
 
-                        if self.config["hw_rnode_atl_short"] == "":
-                            atl_short = None
-                        else:
-                            atl_short = self.config["hw_rnode_atl_short"]
+                        RNS.log("Getting platform RNode interfaces...")
+                        if RNS.vendor.platformutils.get_platform() == "android":
+                            rnodeinterface = RNS.Interfaces.Android.RNodeInterface.RNodeInterface(
+                                    RNS.Transport,
+                                    "RNodeInterface",
+                                    target_port,
+                                    frequency = self.config["hw_rnode_frequency"],
+                                    bandwidth = self.config["hw_rnode_bandwidth"],
+                                    txpower = self.config["hw_rnode_tx_power"],
+                                    sf = self.config["hw_rnode_spreading_factor"],
+                                    cr = self.config["hw_rnode_coding_rate"],
+                                    flow_control = None,
+                                    id_interval = self.config["hw_rnode_beaconinterval"],
+                                    id_callsign = self.config["hw_rnode_beacondata"],
+                                    allow_bluetooth = rnode_allow_bluetooth,
+                                    target_device_name = bt_device_name,
+                                )
+                        elif RNS.vendor.platformutils.get_platform() == "ios":
+                            RNS.log("RNode iOS setup... " )
+                            #+ RNS.Interfaces.iOS.RNodeInterface.iOS_object)
+                            #RNS.log(' stuff: ', RNS.Interfaces.iOS.RNodeInterface.iOS_object )
+                            #RNS.log(" twee twee ")
+                            rnodeinterface = RNS.Interfaces.iOS.RNodeInterface.RNodeInterface(
+                                    RNS.Transport,
+                                    "RNodeInterface",
+                                    target_port,
+                                    # sample test values from rnsd.py, USA 915MHz
+                                    #self.config["hw_rnode_frequency"]
+                                    frequency = 915000000 ,
+                                    #self.config["hw_rnode_bandwidth"]
+                                    bandwidth = 125000 ,
+                                    #bandwidth = 62500 ,
+                                    #self.config["hw_rnode_tx_power"]
+                                    txpower = 7 ,
+                                    #self.config["hw_rnode_spreading_factor"]
+                                    sf = 8 ,
+                                    #self.config["hw_rnode_coding_rate"]
+                                    cr = 5 ,
+                                    flow_control = None,
+                                    # 600
+                                    id_interval = self.config["hw_rnode_beaconinterval"],
+                                    # MYCALL-0
+                                    id_callsign = self.config["hw_rnode_beacondata"],
+                                    allow_bluetooth = rnode_allow_bluetooth,
+                                    target_device_name = bt_device_name,
+                                )
+                            # rnodeinterface = RNS.Interfaces.iOS.RNodeInterface.RNodeInterface(
+                            #         RNS.Transport,
+                            #         "RNodeInterface",
+                            #         target_port,
+                            #         frequency = self.config["hw_rnode_frequency"],
+                            #         bandwidth = self.config["hw_rnode_bandwidth"],
+                            #         txpower = self.config["hw_rnode_tx_power"],
+                            #         sf = self.config["hw_rnode_spreading_factor"],
+                            #         cr = self.config["hw_rnode_coding_rate"],
+                            #         flow_control = None,
+                            #         id_interval = self.config["hw_rnode_beaconinterval"],
+                            #         id_callsign = self.config["hw_rnode_beacondata"],
+                            #         allow_bluetooth = rnode_allow_bluetooth,
+                            #         target_device_name = bt_device_name,
+                            #     )
 
-                        if self.config["hw_rnode_atl_long"] == "":
-                            atl_long = None
-                        else:
-                            atl_long = self.config["hw_rnode_atl_long"]
-
-                        rnodeinterface = RNS.Interfaces.Android.RNodeInterface.RNodeInterface(
-                                RNS.Transport,
-                                "RNodeInterface",
-                                target_port,
-                                frequency = self.config["hw_rnode_frequency"],
-                                bandwidth = self.config["hw_rnode_bandwidth"],
-                                txpower = self.config["hw_rnode_tx_power"],
-                                sf = self.config["hw_rnode_spreading_factor"],
-                                cr = self.config["hw_rnode_coding_rate"],
-                                flow_control = None,
-                                id_interval = self.config["hw_rnode_beaconinterval"],
-                                id_callsign = self.config["hw_rnode_beacondata"],
-                                allow_bluetooth = rnode_allow_bluetooth,
-                                target_device_name = bt_device_name,
-                                st_alock = atl_short,
-                                lt_alock = atl_long,
-                            )
-
+                            RNS.log("RNode iOS interface loaded ")
                         rnodeinterface.OUT = True
 
                         if RNS.Reticulum.transport_enabled():
-                            if_mode = Interface.Interface.MODE_FULL
+                            if_mode = Interface.RNSInterface.MODE_FULL
                             if self.config["connect_ifmode_rnode"] == "gateway":
-                                if_mode = Interface.Interface.MODE_GATEWAY
+                                if_mode = Interface.RNSInterface.MODE_GATEWAY
                             elif self.config["connect_ifmode_rnode"] == "access point":
-                                if_mode = Interface.Interface.MODE_ACCESS_POINT
+                                if_mode = Interface.RNSInterface.MODE_ACCESS_POINT
                             elif self.config["connect_ifmode_rnode"] == "roaming":
-                                if_mode = Interface.Interface.MODE_ROAMING
+                                if_mode = Interface.RNSInterface.MODE_ROAMING
                             elif self.config["connect_ifmode_rnode"] == "boundary":
-                                if_mode = Interface.Interface.MODE_BOUNDARY
+                                if_mode = Interface.RNSInterface.MODE_BOUNDARY
                         else:
                             if_mode = None
+
+                        RNS.log("RNode iOS - 2  ")
                             
                         self.reticulum._add_interface(rnodeinterface, mode = if_mode, ifac_netname = ifac_netname, ifac_netkey = ifac_netkey)
                         self.interface_rnode = rnodeinterface
+
+                        RNS.log("RNode iOS - 3  ")
 
                         if rnodeinterface != None:
                             if len(rnodeinterface.hw_errors) > 0:
                                 self.setpersistent("startup.errors.rnode", rnodeinterface.hw_errors[0])
 
-                        if self.config["hw_rnode_enable_framebuffer"] == True:
-                            if self.interface_rnode.online:
-                                self.interface_rnode.display_image(sideband_fb_data)
-                                self.interface_rnode.enable_external_framebuffer()
-                            else:
-                                self.interface_rnode.last_imagedata = sideband_fb_data
+                        if self.interface_rnode.online:
+                            self.interface_rnode.display_image(sideband_fb_data)
+                            self.interface_rnode.enable_external_framebuffer()
                         else:
-                            if self.interface_rnode.online:
-                                self.interface_rnode.disable_external_framebuffer()
+                            self.interface_rnode.last_imagedata = sideband_fb_data
 
                     except Exception as e:
                         RNS.log("Error while adding RNode Interface. The contained exception was: "+str(e))
@@ -3044,15 +1933,15 @@ class SidebandCore():
                             serialinterface.OUT = True
 
                             if RNS.Reticulum.transport_enabled():
-                                if_mode = Interface.Interface.MODE_FULL
+                                if_mode = Interface.RNSInterface.MODE_FULL
                                 if self.config["connect_ifmode_serial"] == "gateway":
-                                    if_mode = Interface.Interface.MODE_GATEWAY
+                                    if_mode = Interface.RNSInterface.MODE_GATEWAY
                                 elif self.config["connect_ifmode_serial"] == "access point":
-                                    if_mode = Interface.Interface.MODE_ACCESS_POINT
+                                    if_mode = Interface.RNSInterface.MODE_ACCESS_POINT
                                 elif self.config["connect_ifmode_serial"] == "roaming":
-                                    if_mode = Interface.Interface.MODE_ROAMING
+                                    if_mode = Interface.RNSInterface.MODE_ROAMING
                                 elif self.config["connect_ifmode_serial"] == "boundary":
-                                    if_mode = Interface.Interface.MODE_BOUNDARY
+                                    if_mode = Interface.RNSInterface.MODE_BOUNDARY
                             else:
                                 if_mode = None
                                 
@@ -3104,15 +1993,15 @@ class SidebandCore():
                             modeminterface.OUT = True
 
                             if RNS.Reticulum.transport_enabled():
-                                if_mode = Interface.Interface.MODE_FULL
+                                if_mode = Interface.RNSInterface.MODE_FULL
                                 if self.config["connect_ifmode_modem"] == "gateway":
-                                    if_mode = Interface.Interface.MODE_GATEWAY
+                                    if_mode = Interface.RNSInterface.MODE_GATEWAY
                                 elif self.config["connect_ifmode_modem"] == "access point":
-                                    if_mode = Interface.Interface.MODE_ACCESS_POINT
+                                    if_mode = Interface.RNSInterface.MODE_ACCESS_POINT
                                 elif self.config["connect_ifmode_modem"] == "roaming":
-                                    if_mode = Interface.Interface.MODE_ROAMING
+                                    if_mode = Interface.RNSInterface.MODE_ROAMING
                                 elif self.config["connect_ifmode_modem"] == "boundary":
-                                    if_mode = Interface.Interface.MODE_BOUNDARY
+                                    if_mode = Interface.RNSInterface.MODE_BOUNDARY
                             else:
                                 if_mode = None
                                 
@@ -3144,10 +2033,7 @@ class SidebandCore():
             else:
                 self.set_active_propagation_node(None)
 
-    def message_notification_no_display(self, message):
-        self.message_notification(message, no_display=True)
-
-    def message_notification(self, message, no_display=False):
+    def message_notification(self, message):
         if message.state == LXMF.LXMessage.FAILED and hasattr(message, "try_propagation_on_fail") and message.try_propagation_on_fail:
             RNS.log("Direct delivery of "+str(message)+" failed. Retrying as propagated message.", RNS.LOG_VERBOSE)
             message.try_propagation_on_fail = None
@@ -3158,58 +2044,7 @@ class SidebandCore():
             self._db_message_set_method(message.hash, LXMF.LXMessage.PROPAGATED)
             self.message_router.handle_outbound(message)
         else:
-            if not no_display:
-                self.lxm_ingest(message, originator=True)
-
-            if message.fields != None and LXMF.FIELD_TELEMETRY in message.fields:
-                if len(message.fields[LXMF.FIELD_TELEMETRY]) > 0:
-                    try:
-                        telemeter = Telemeter.from_packed(message.fields[LXMF.FIELD_TELEMETRY])
-                        telemetry_timebase = telemeter.read_all()["time"]["utc"]
-                        RNS.log("Setting last successul telemetry timebase for "+RNS.prettyhexrep(message.destination_hash)+" to "+str(telemetry_timebase))
-                        self.setpersistent(f"telemetry.{RNS.hexrep(message.destination_hash, delimit=False)}.last_send_success_timebase", telemetry_timebase)
-                    except Exception as e:
-                        RNS.log("Error while setting last successul telemetry timebase for "+RNS.prettyhexrep(message.destination_hash), RNS.LOG_DEBUG)
-
-    def get_message_fields(self, context_dest, telemetry_update=False, is_authorized_telemetry_request=False, signal_already_sent=False):
-        fields = {}
-        send_telemetry = (telemetry_update == True) or (self.should_send_telemetry(context_dest) or is_authorized_telemetry_request)
-        send_appearance = self.config["telemetry_send_appearance"] or send_telemetry
-
-        if send_telemetry and self.latest_packed_telemetry != None:
-            telemeter = Telemeter.from_packed(self.latest_packed_telemetry)
-            telemetry_timebase = telemeter.read_all()["time"]["utc"]
-            if telemetry_timebase > (self.getpersistent(f"telemetry.{RNS.hexrep(context_dest, delimit=False)}.last_send_success_timebase") or 0):
-                RNS.log("Embedding own telemetry in message since current telemetry is newer than latest successful timebase", RNS.LOG_DEBUG)
-            else:
-                RNS.log("Not embedding own telemetry in message since current telemetry is not newer than latest successful timebase", RNS.LOG_DEBUG)
-                send_telemetry = False
-                send_appearance = False
-                if signal_already_sent:
-                    return False
-
-        else:
-            RNS.log("Not embedding telemetry in message since no telemetry is available", RNS.LOG_DEBUG)
-            send_telemetry = False
-
-        if send_telemetry or send_appearance:
-            if send_appearance:
-                def fth(c):
-                    r = c[0]; g = c[1]; b = c[2]
-                    r = min(max(0, r), 1); g = min(max(0, g), 1); b = min(max(0, b), 1)
-                    d = 1.0/255.0
-                    return struct.pack("!BBB", int(r/d), int(g/d), int(b/d))
-
-                icon = self.config["telemetry_icon"]
-                fg = fth(self.config["telemetry_fg"][:-1])
-                bg = fth(self.config["telemetry_bg"][:-1])
-
-                fields[LXMF.FIELD_ICON_APPEARANCE] = [icon, fg, bg]
-
-            if send_telemetry:
-                fields[LXMF.FIELD_TELEMETRY] = self.latest_packed_telemetry
-
-        return fields
+            self.lxm_ingest(message, originator=True)
 
     def paper_message(self, content, destination_hash):
         try:
@@ -3221,7 +2056,7 @@ class SidebandCore():
             source = self.lxmf_destination
             
             desired_method = LXMF.LXMessage.PAPER
-            lxm = LXMF.LXMessage(dest, source, content, title="", desired_method=desired_method, fields = self.get_message_fields(destination_hash))
+            lxm = LXMF.LXMessage(dest, source, content, title="", desired_method=desired_method)
 
             self.lxm_ingest(lxm, originator=True)
 
@@ -3231,7 +2066,7 @@ class SidebandCore():
             RNS.log("Error while creating paper message: "+str(e), RNS.LOG_ERROR)
             return False
 
-    def send_message(self, content, destination_hash, propagation, skip_fields=False, no_display=False):
+    def send_message(self, content, destination_hash, propagation):
         try:
             if content == "":
                 raise ValueError("Message content cannot be empty")
@@ -3245,68 +2080,12 @@ class SidebandCore():
             else:
                 desired_method = LXMF.LXMessage.DIRECT
 
-            if skip_fields:
-                fields = {}
-            else:
-                fields = self.get_message_fields(destination_hash)
-
-            lxm = LXMF.LXMessage(dest, source, content, title="", desired_method=desired_method, fields = fields)
-            
-            if not no_display:
-                lxm.register_delivery_callback(self.message_notification)
-                lxm.register_failed_callback(self.message_notification)
-            else:
-                lxm.register_delivery_callback(self.message_notification_no_display)
-                lxm.register_failed_callback(self.message_notification_no_display)
-
-            if self.message_router.get_outbound_propagation_node() != None:
-                if self.config["lxmf_try_propagation_on_fail"]:
-                    lxm.try_propagation_on_fail = True
-
-            self.message_router.handle_outbound(lxm)
-            if not no_display:
-                self.lxm_ingest(lxm, originator=True)
-
-            return True
-
-        except Exception as e:
-            RNS.log("Error while sending message: "+str(e), RNS.LOG_ERROR)
-            return False
-
-    def send_command(self, content, destination_hash, propagation):
-        try:
-            if content == "":
-                return False
-
-            commands = []
-            if content.startswith("echo "):
-                echo_content = content.replace("echo ", "").encode("utf-8")
-                if len(echo_content) > 0:
-                    commands.append({Commands.ECHO: echo_content})
-            elif content.startswith("sig"):
-                commands.append({Commands.SIGNAL_REPORT: True})
-            elif content.startswith("ping"):
-                commands.append({Commands.PING: True})
-
-            if len(commands) == 0:
-                return False
-
-            dest_identity = RNS.Identity.recall(destination_hash)
-            dest = RNS.Destination(dest_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
-            source = self.lxmf_destination
-            
-            if propagation:
-                desired_method = LXMF.LXMessage.PROPAGATED
-            else:
-                desired_method = LXMF.LXMessage.DIRECT
-
-            lxm = LXMF.LXMessage(dest, source, "", title="", desired_method=desired_method, fields = {LXMF.FIELD_COMMANDS: commands})
+            lxm = LXMF.LXMessage(dest, source, content, title="", desired_method=desired_method)
             lxm.register_delivery_callback(self.message_notification)
             lxm.register_failed_callback(self.message_notification)
 
             if self.message_router.get_outbound_propagation_node() != None:
-                if self.config["lxmf_try_propagation_on_fail"]:
-                    lxm.try_propagation_on_fail = True
+                lxm.try_propagation_on_fail = True
 
             self.message_router.handle_outbound(lxm)
             self.lxm_ingest(lxm, originator=True)
@@ -3368,62 +2147,43 @@ class SidebandCore():
     def lxm_ingest(self, message, originator = False):
         should_notify = False
         is_trusted = False
-        telemetry_only = False
-        own_command = False
-        unread_reason_tx = False
 
         if originator:
             context_dest = message.destination_hash
-            unread_reason_tx = True
         else:
             context_dest = message.source_hash
             is_trusted = self.is_trusted(context_dest)
-
-        if originator and LXMF.FIELD_COMMANDS in message.fields:
-            own_command = True
 
         if self._db_message(message.hash):
             RNS.log("Message exists, setting state to: "+str(message.state), RNS.LOG_DEBUG)
             self._db_message_set_state(message.hash, message.state)
         else:
             RNS.log("Message does not exist, saving", RNS.LOG_DEBUG)
-            self._db_save_lxm(message, context_dest, originator, own_command=own_command)
+            self._db_save_lxm(message, context_dest)
 
             if is_trusted:
                 should_notify = True
 
-            if len(message.content) == 0 and len(message.title) == 0:
-                if (LXMF.FIELD_TELEMETRY in message.fields or LXMF.FIELD_TELEMETRY_STREAM in message.fields or LXMF.FIELD_COMMANDS in message.fields):
-                    RNS.log("Squelching notification due to telemetry-only message", RNS.LOG_DEBUG)
-                    telemetry_only = True
+        if self._db_conversation(context_dest) == None:
+            self._db_create_conversation(context_dest)
+            self.setstate("app.flags.new_conversations", True)
 
-        if not telemetry_only:
-            if self._db_conversation(context_dest) == None:
-                self._db_create_conversation(context_dest)
-                self.setstate("app.flags.new_conversations", True)
-
-            if self.gui_display() == "messages_screen":
-                if self.gui_conversation() != context_dest:
-                    self.unread_conversation(context_dest, tx=unread_reason_tx)
-                    self.setstate("app.flags.unread_conversations", True)
-                else:
-                    self.txtime_conversation(context_dest)
-                    self.setstate("wants.viewupdate.conversations", True)
-                    if self.gui_foreground():
-                        RNS.log("Squelching notification since GUI is in foreground", RNS.LOG_DEBUG)
-                        should_notify = False
-            else:
-                self.unread_conversation(context_dest, tx=unread_reason_tx)
+        if self.gui_display() == "messages_screen":
+            if self.gui_conversation() != context_dest:
+                self.unread_conversation(context_dest)
                 self.setstate("app.flags.unread_conversations", True)
+            else:
+                if self.gui_foreground():
+                    should_notify = False
+        else:
+            self.unread_conversation(context_dest)
+            self.setstate("app.flags.unread_conversations", True)
 
-                if RNS.vendor.platformutils.is_android():
-                    if self.gui_display() == "conversations_screen" and self.gui_foreground():
-                        should_notify = False
+            if RNS.vendor.platformutils.is_android():
+                if self.gui_display() == "conversations_screen" and self.gui_foreground():
+                    should_notify = False
 
         if self.is_client:
-            should_notify = False
-
-        if telemetry_only:
             should_notify = False
 
         if should_notify:
@@ -3443,74 +2203,11 @@ class SidebandCore():
         thread.setDaemon(True)
         thread.start()
 
-        self.setstate("core.started", True)
+        self._db_setstate("core.started", True)
         RNS.log("Sideband Core "+str(self)+" started")
 
-    def stop_webshare(self):
-        if self.webshare_server != None:
-            self.webshare_server.shutdown()
-            self.webshare_server = None
-
-    def start_webshare(self):
-        if self.webshare_server == None:
-            def webshare_job():
-                from http import server
-                import socketserver
-                import json
-
-                webshare_dir = self.webshare_dir
-                port = 4444
-                class RequestHandler(server.SimpleHTTPRequestHandler):
-                    def do_GET(self):
-                        serve_root = webshare_dir
-                        if "?" in self.path:
-                            self.path = self.path.split("?")[0]
-                        path = serve_root + self.path
-                        if self.path == "/":
-                            path = serve_root + "/index.html"
-                        if "/.." in self.path:
-                            self.send_response(403)
-                            self.end_headers()
-                            self.write("Forbidden".encode("utf-8"))
-                        elif self.path == "/pkglist":
-                            try:
-                                self.send_response(200)
-                                self.send_header("Content-type", "text/json")
-                                self.end_headers()
-                                json_result = json.dumps(os.listdir(serve_root+"/pkg"))
-                                self.wfile.write(json_result.encode("utf-8"))
-                            except Exception as e:
-                                self.send_response(500)
-                                self.end_headers()
-                                RNS.log("Error listing directory "+str(path)+": "+str(e), RNS.LOG_ERROR)
-                                es = "Error"
-                                self.wfile.write(es.encode("utf-8"))
-                        else:
-                            try:
-                                with open(path, 'rb') as f:
-                                    data = f.read()
-                                self.send_response(200)
-                                if path.lower().endswith(".apk"):
-                                    self.send_header("Content-type", "application/vnd.android.package-archive")
-                                self.end_headers()
-                                self.wfile.write(data)
-                            except Exception as e:
-                                self.send_response(500)
-                                self.end_headers()
-                                RNS.log("Error serving file "+str(path)+": "+str(e), RNS.LOG_ERROR)
-                                es = "Error"
-                                self.wfile.write(es.encode("utf-8"))
-
-                with socketserver.TCPServer(("", port), RequestHandler) as webserver:
-                    self.webshare_server = webserver
-                    webserver.serve_forever()
-                    self.webshare_server = None
-                    RNS.log("Webshare server closed", RNS.LOG_DEBUG)
-
-            threading.Thread(target=webshare_job, daemon=True).start()
-
     def request_lxmf_sync(self, limit = None):
-        if self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_IDLE or self.message_router.propagation_transfer_state >= LXMF.LXMRouter.PR_COMPLETE:
+        if self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_IDLE or self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_COMPLETE:
             self.message_router.request_messages_from_propagation_node(self.identity, max_messages = limit)
             RNS.log("LXMF message sync requested from propagation node "+RNS.prettyhexrep(self.message_router.get_outbound_propagation_node())+" for "+str(self.identity))
             return True
@@ -3522,18 +2219,7 @@ class SidebandCore():
             self.message_router.cancel_propagation_node_requests()
 
     def get_sync_progress(self):
-        state = self.message_router.propagation_transfer_state
-        if state == LXMF.LXMRouter.PR_PATH_REQUESTED:
-            state_val = 0.05
-        elif state == LXMF.LXMRouter.PR_LINK_ESTABLISHING:
-            state_val = 0.1
-        elif state == LXMF.LXMRouter.PR_LINK_ESTABLISHED:
-            state_val = 0.15
-        elif state >= LXMF.LXMRouter.PR_REQUEST_SENT:
-            state_val = 0.2
-        else:
-            state_val = 0.0
-        return (self.message_router.propagation_transfer_progress*0.8)+state_val
+        return self.message_router.propagation_transfer_progress
 
     def lxmf_delivery(self, message):
         time_string = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(message.timestamp))
@@ -3546,105 +2232,12 @@ class SidebandCore():
             if message.unverified_reason == LXMF.LXMessage.SOURCE_UNKNOWN:
                 signature_string = "Cannot verify, source is unknown"
 
-        RNS.log("LXMF delivery "+str(time_string)+". "+str(signature_string)+".", RNS.LOG_DEBUG)
+        RNS.log("LXMF delivery "+str(time_string)+". "+str(signature_string)+".")
 
         try:
-            context_dest = message.source_hash
-            if self.config["lxmf_ignore_unknown"] == True:
-                if self._db_conversation(context_dest) == None:
-                    RNS.log("Dropping message from unknown sender "+RNS.prettyhexrep(context_dest), RNS.LOG_DEBUG)
-                    return
-
-            if message.signature_validated and LXMF.FIELD_COMMANDS in message.fields:
-                if self.allow_request_from(context_dest):
-                    commands = message.fields[LXMF.FIELD_COMMANDS]
-                    self.handle_commands(commands, message)
-                else:
-                    # TODO: Add these event to built-in log/event viewer
-                    # when it is implemented.
-                    RNS.log("Unauthorized command received from "+RNS.prettyhexrep(context_dest), RNS.LOG_WARNING)
-
-            else:
-                self.lxm_ingest(message)
-
+            self.lxm_ingest(message)
         except Exception as e:
-            RNS.log("Error while ingesting LXMF message "+RNS.prettyhexrep(message.hash)+" to database: "+str(e), RNS.LOG_ERROR)
-
-    def handle_commands(self, commands, message):
-        try:
-            context_dest = message.source_hash
-            RNS.log("Handling commands from "+RNS.prettyhexrep(context_dest), RNS.LOG_DEBUG)
-            for command in commands:
-                if Commands.TELEMETRY_REQUEST in command:
-                    timebase = int(command[Commands.TELEMETRY_REQUEST])
-                    RNS.log("Handling telemetry request with timebase "+str(timebase), RNS.LOG_DEBUG)
-                    if self.config["telemetry_collector_enabled"]:
-                        RNS.log(f"Collector requests enabled, returning complete telemetry response for all known objects since {timebase}", RNS.LOG_DEBUG)
-                        self.create_telemetry_collector_response(to_addr=context_dest, timebase=timebase, is_authorized_telemetry_request=True)
-                    else:
-                        RNS.log("Responding with own latest telemetry", RNS.LOG_DEBUG)
-                        self.send_latest_telemetry(to_addr=context_dest)
-                
-                elif Commands.PING in command:
-                    RNS.log("Handling ping request", RNS.LOG_DEBUG)
-                    self.send_message("Ping reply", context_dest, False, skip_fields=True, no_display=True)
-                
-                elif Commands.ECHO in command:
-                    msg_content = "Echo reply: "+command[Commands.ECHO].decode("utf-8")
-                    RNS.log("Handling echo request", RNS.LOG_DEBUG)
-                    self.send_message(msg_content, context_dest, False, skip_fields=True, no_display=True)
-                
-                elif Commands.SIGNAL_REPORT in command:
-                    RNS.log("Handling signal report", RNS.LOG_DEBUG)
-                    phy_str = ""
-                    if message.q != None:
-                        phy_str += f"Link Quality: {message.q}%\n"
-                    if message.rssi != None:
-                        phy_str += f"RSSI: {message.rssi} dBm\n"
-                    if message.snr != None:
-                        phy_str += f"SNR: {message.snr} dB\n"
-                    if len(phy_str) != 0:
-                        phy_str = phy_str[:-1]
-                    else:
-                        phy_str = "No reception info available"
-
-                    self.send_message(phy_str, context_dest, False, skip_fields=True, no_display=True)
-
-        except Exception as e:
-            RNS.log("Error while handling commands: "+str(e), RNS.LOG_ERROR)
-
-    def create_telemetry_collector_response(self, to_addr, timebase, is_authorized_telemetry_request=False):
-        added_sources = {}
-        sources = self.list_telemetry(after=timebase)
-        only_latest = self.config["telemetry_requests_only_send_latest"]
-
-        elements = 0; added = 0
-        telemetry_stream = []
-        for source in sources:
-            if source != to_addr:
-                for entry in sources[source]:
-                    elements += 1
-                    timestamp = entry[0]; packed_telemetry = entry[1]
-                    appearance = self._db_get_appearance(source, raw=True)
-                    te = [source, timestamp, packed_telemetry, appearance]
-                    if only_latest:
-                        if not source in added_sources:
-                            added_sources[source] = True
-                            telemetry_stream.append(te)
-                            added += 1
-                    else:
-                        telemetry_stream.append(te)
-                        added += 1
-
-        if len(telemetry_stream) == 0:
-            RNS.log(f"No new telemetry for request with timebase {timebase}", RNS.LOG_DEBUG)
-
-        return self.send_latest_telemetry(
-            to_addr=to_addr,
-            stream=telemetry_stream,
-            is_authorized_telemetry_request=is_authorized_telemetry_request
-        )
-
+            RNS.log("Error while ingesting LXMF message "+RNS.prettyhexrep(message.hash)+" to database: "+str(e))
 
     def get_display_name_bytes(self):
         return self.config["display_name"].encode("utf-8")
@@ -3664,18 +2257,6 @@ class SidebandCore():
             return "Receiving messages"
         elif self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_RESPONSE_RECEIVED:
             return "Messages received"
-        elif self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_NO_PATH:
-            return "No path to propagation node"
-        elif self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_LINK_FAILED:
-            return "Link establisment failed"
-        elif self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_TRANSFER_FAILED:
-            return "Sync request failed"
-        elif self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_NO_IDENTITY_RCVD:
-            return "No identity received by remote"
-        elif self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_NO_ACCESS:
-            return "No access to specified node"
-        elif self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_FAILED:
-            return "Sync failed"
         elif self.message_router.propagation_transfer_state == LXMF.LXMRouter.PR_COMPLETE:
             new_msgs = self.message_router.propagation_transfer_last_result
             if new_msgs == 0:
@@ -3700,5 +2281,31 @@ panic_on_interface_error = No
 
 [logging]
 loglevel = 3
+
+[interfaces]
+
+  [[Default Interface]]
+    type = AutoInterface
+    enabled =  Yes
+
+# below are not used,
+# Reticulum default loads when iOS is re-installed clean
+
+  [[RNS Testnet Dublin]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = dublin.connect.reticulum.network
+    target_port = 4965
+  [[RNS Testnet Frankfurt]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = frankfurt.connect.reticulum.network
+    target_port = 5377
+
+  [[Local mac]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = 192.168.2.13
+    target_port = 4242
 
 """
