@@ -1,5 +1,6 @@
 __debug_build__ = False
 
+import sys
 import time
 import RNS
 from os import environ
@@ -13,10 +14,23 @@ else:
 
 if RNS.vendor.platformutils.get_platform() == "android":
     from jnius import autoclass, cast
+
+    # Squelch excessive method signature logging
+    import jnius.reflect
+    class redirect_log():
+        def isEnabledFor(self, arg):
+            return False
+        def debug(self, arg):
+            pass
+    def mod(method, name, signature):
+        pass
+    jnius.reflect.log_method = mod
+    jnius.reflect.log = redirect_log()
+    ############################################
+
     from android import python_act
     android_api_version = autoclass('android.os.Build$VERSION').SDK_INT
-
-    Context = autoclass('android.content.Context')
+            
     Intent = autoclass('android.content.Intent')
     BitmapFactory = autoclass('android.graphics.BitmapFactory')
     Icon = autoclass("android.graphics.drawable.Icon")
@@ -37,6 +51,15 @@ else:
     from sbapp.sideband.core import SidebandCore
 
 class SidebandService():
+    usb_device_filter = {
+        0x0403: [0x6001, 0x6010, 0x6011, 0x6014, 0x6015], # FTDI
+        0x10C4: [0xea60, 0xea70, 0xea71], # SiLabs
+        0x067B: [0x2303, 0x23a3, 0x23b3, 0x23c3, 0x23d3, 0x23e3, 0x23f3], # Prolific
+        0x1a86: [0x5523, 0x7523, 0x55D4], # Qinheng
+        0x0483: [0x5740], # ST CDC
+        0x2E8A: [0x0005, 0x000A], # Raspberry Pi Pico
+    }
+    
     def android_notification(self, title="", content="", ticker="", group=None, context_id=None):
         if android_api_version < 26:
             return
@@ -98,18 +121,85 @@ class SidebandService():
             built_notification = notification.build()
             self.notification_service.notify(0, built_notification)
 
+    def check_permission(self, permission):
+        if RNS.vendor.platformutils.is_android():
+            try:
+                result = self.android_service.checkSelfPermission("android.permission."+permission)
+                if result == 0:
+                    return True
+
+            except Exception as e:
+                RNS.log("Error while checking permission: "+str(e), RNS.LOG_ERROR)
+            
+            return False
+        
+        else:
+            return False
+
+    def background_location_allowed(self):
+        if not RNS.vendor.platformutils.is_android():
+            return False
+
+        perms = ["ACCESS_FINE_LOCATION","ACCESS_COARSE_LOCATION","ACCESS_BACKGROUND_LOCATION"]
+        for perm in perms:
+            if not self.check_permission(perm):
+                return False
+
+        return True
+
+    def android_location_callback(self, **kwargs):
+        self._raw_gps = kwargs
+        self._last_gps_update = time.time()
+
+    def should_update_location(self):
+        if self.sideband.config["telemetry_enabled"] and self.sideband.config["telemetry_s_location"] and self.background_location_allowed():
+            return True
+        else:
+            return False
+
+    def update_location_provider(self):
+        if RNS.vendor.platformutils.is_android():
+            if self.should_update_location():
+                if not self._gps_started:
+                    RNS.log("Starting service location provider", RNS.LOG_DEBUG)
+                    
+                    if self.gps == None:
+                        from plyer import gps
+                        self.gps = gps
+
+                    self.gps.configure(on_location=self.android_location_callback)
+                    self.gps.start(minTime=self._gps_stale_time, minDistance=self._gps_min_distance)
+                    self._gps_started = True
+
+            else:
+                if self._gps_started:
+                    RNS.log("Stopping service location provider", RNS.LOG_DEBUG)
+                    if self.gps != None:
+                        self.gps.stop()
+                    self._gps_started = False
+                    self._raw_gps = None
+
+    def get_location(self):
+        return self._last_gps_update, self._raw_gps
+
     def __init__(self):
         self.argument = environ.get('PYTHON_SERVICE_ARGUMENT', '')
         self.app_dir = self.argument
         self.multicast_lock = None
         self.wake_lock = None
         self.should_run = False
+        self.gps = None
+        self._gps_started = False
+        self._gps_stale_time = 300-1
+        self._gps_min_distance = 3
+        self._raw_gps = None
 
         self.android_service = None
         self.app_context = None
         self.wifi_manager = None
         self.power_manager = None
         self.usb_devices = []
+        self.usb_device_filter = SidebandService.usb_device_filter
 
         self.notification_service = None
         self.notification_channel = None
@@ -125,9 +215,7 @@ class SidebandService():
 
             self.discover_usb_devices()
         
-        self.sideband = SidebandCore(self, is_service=True, android_app_dir=self.app_dir, verbose=__debug_build__)
-        self.sideband.service_context = self.android_service
-        self.sideband.owner_service = self
+        self.sideband = SidebandCore(self, is_service=True, android_app_dir=self.app_dir, verbose=__debug_build__, owner_service=self, service_context=self.android_service)
 
         if self.sideband.config["debug"]:
             Logger.setLevel(LOG_LEVELS["debug"])
@@ -137,6 +225,7 @@ class SidebandService():
         
         if RNS.vendor.platformutils.is_android():
             RNS.log("Discovered USB devices: "+str(self.usb_devices), RNS.LOG_EXTREME)
+            self.update_location_provider()
 
 
     def discover_usb_devices(self):
@@ -152,7 +241,9 @@ class SidebandService():
                     "manufacturer": device.getManufacturerName(),
                     "productname": device.getProductName(),
                 }
-                self.usb_devices.append(device_entry)
+                if device_entry["vid"] in self.usb_device_filter:
+                    if device_entry["pid"] in self.usb_device_filter[device_entry["vid"]]:
+                        self.usb_devices.append(device_entry)
 
         except Exception as e:
             RNS.log("Could not list USB devices. The contained exception was: "+str(e), RNS.LOG_ERROR)
@@ -168,6 +259,7 @@ class SidebandService():
     def take_locks(self, force_multicast=False):
         if RNS.vendor.platformutils.get_platform() == "android":
             if self.multicast_lock == None or force_multicast:
+                RNS.log("Creating multicast lock", RNS.LOG_DEBUG)
                 self.multicast_lock = self.wifi_manager.createMulticastLock("sideband_service")
 
             if not self.multicast_lock.isHeld():
@@ -177,6 +269,7 @@ class SidebandService():
                 RNS.log("Multicast lock already held", RNS.LOG_DEBUG)
 
             if self.wake_lock == None:
+                RNS.log("Creating wake lock", RNS.LOG_DEBUG)
                 self.wake_lock = self.power_manager.newWakeLock(self.power_manager.PARTIAL_WAKE_LOCK, "sideband_service")
 
             if not self.wake_lock.isHeld():
@@ -328,6 +421,7 @@ class SidebandService():
             self.sideband.setstate("service.connectivity_status", self.get_connectivity_status())
 
             if self.sideband.getstate("wants.service_stop"):
+                self.sideband.service_stopped = True
                 self.should_run = False
                 sleep_time = 0
 
@@ -345,4 +439,19 @@ class SidebandService():
         self.sideband.cleanup()
         self.release_locks()
 
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    if exc_type == SystemExit:
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    import traceback
+    exc_text = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    RNS.log(f"An unhandled {str(exc_type)} exception occurred: {str(exc_value)}", RNS.LOG_ERROR)
+    RNS.log(exc_text, RNS.LOG_ERROR)
+
+sys.excepthook = handle_exception
 SidebandService().start()

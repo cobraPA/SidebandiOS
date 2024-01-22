@@ -21,7 +21,7 @@ import plyer
 import subprocess
 import shlex
 
-if RNS.vendor.platformutils.get_platform() == "android":
+if RNS.vendor.platformutils.get_platform() == "android" or RNS.vendor.platformutils.get_platform() == "ios":
     from sideband.sense import Telemeter, Commands
     from ui.helpers import ts_format, file_ts_format, mdc
     from ui.helpers import color_received, color_delivered, color_propagated, color_paper, color_failed, color_unknown, intensity_msgs_dark, intensity_msgs_light

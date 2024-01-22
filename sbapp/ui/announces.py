@@ -16,7 +16,7 @@ from kivymd.uix.dialog import MDDialog
 
 from kivy.lang.builder import Builder
 
-if RNS.vendor.platformutils.get_platform() == "android":
+if RNS.vendor.platformutils.get_platform() == "android" or RNS.vendor.platformutils.get_platform() == "ios":
     from ui.helpers import ts_format
 else:
     from .helpers import ts_format
@@ -28,11 +28,22 @@ class Announces():
         self.added_item_dests = []
         self.list = None
 
+        print('XXX announces 1')
+        print('app', app)
         if not self.app.root.ids.screen_manager.has_screen("announces_screen"):
+            print('XXX announces 2')
+            print('string', layout_announces_screen)
             self.screen = Builder.load_string(layout_announces_screen)
+            print('XXX announces 3')
+            print('announces -', self.screen)
             self.screen.app = self.app
             self.ids = self.screen.ids
+            ##self.app.add_widget(self.screen)
+            # kjb - was testing
+            #self.app.sm.add_widget(self.screen)
+            #original
             self.app.root.ids.screen_manager.add_widget(self.screen)
+            #print('add', self.app.root.ids.screen_manager.add_widget(self.screen))
 
         self.fetch_announces()
         self.list = MDList()

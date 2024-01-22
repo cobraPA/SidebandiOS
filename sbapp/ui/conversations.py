@@ -42,6 +42,13 @@ class Conversations():
             self.screen = Builder.load_string(conv_screen_kv)
             self.screen.app = self.app
             self.ids = self.screen.ids
+            # kjb test - was testing
+            #self.app.sm.add_widget(self.screen)
+            
+            #print('add conversations')
+            # kjb test - missing?
+            #print('widget', self.app.root.ids.conversations_scrollview)
+            ## original
             self.app.root.ids.screen_manager.add_widget(self.screen)
         
         self.conversation_dropdown = None
